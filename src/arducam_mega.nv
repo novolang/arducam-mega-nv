@@ -93,70 +93,70 @@ use embedded_hal.{ BoardSpi, BoardGpio, BoardTimer, SpiBus, GpioOut }
 use dev_bus.{ DeviceWiring, DevBytes }
 
 // The registers.
-let R_POWER = 0x02
-let R_FIFO = 0x04
-let R_RESET = 0x07
-let R_DEBUG_ADDR = 0x0A
-let R_DEBUG_REG_HI = 0x0B
-let R_DEBUG_REG_LO = 0x0C
-let R_DEBUG_VAL_LO = 0x0D
-let R_DEBUG_VAL_HI = 0x0E
-let R_FORMAT = 0x20
-let R_RESOLUTION = 0x21
-let R_BRIGHTNESS = 0x22
-let R_CONTRAST = 0x23
-let R_SATURATION = 0x24
-let R_EV = 0x25
+let R_POWER         = 0x02
+let R_FIFO          = 0x04
+let R_RESET         = 0x07
+let R_DEBUG_ADDR    = 0x0A
+let R_DEBUG_REG_HI  = 0x0B
+let R_DEBUG_REG_LO  = 0x0C
+let R_DEBUG_VAL_LO  = 0x0D
+let R_DEBUG_VAL_HI  = 0x0E
+let R_FORMAT        = 0x20
+let R_RESOLUTION    = 0x21
+let R_BRIGHTNESS    = 0x22
+let R_CONTRAST      = 0x23
+let R_SATURATION    = 0x24
+let R_EV            = 0x25
 let R_WHITE_BALANCE = 0x26
-let R_EFFECT = 0x27
-let R_SHARPNESS = 0x28
-let R_POWER_MODE = 0x28
-let R_FOCUS = 0x29
-let R_QUALITY = 0x2A
-let R_ROTATION = 0x2B
-let R_AE_FREEZE = 0x2C
-let R_AWB_FREEZE = 0x2D
-let R_AUTO = 0x30
-let R_GAIN_HI = 0x31
-let R_GAIN_LO = 0x32
-let R_EXPOSURE_HI = 0x33
-let R_EXPOSURE_MID = 0x34
-let R_EXPOSURE_LO = 0x35
-let R_BURST = 0x3C
-let R_SENSOR_ID = 0x40
-let R_YEAR = 0x41
-let R_MONTH = 0x42
-let R_DAY = 0x43
-let R_STATE = 0x44
-let R_SIZE_LO = 0x45
-let R_SIZE_MID = 0x46
-let R_SIZE_HI = 0x47
-let R_VERSION = 0x49
+let R_EFFECT        = 0x27
+let R_SHARPNESS     = 0x28
+let R_POWER_MODE    = 0x28
+let R_FOCUS         = 0x29
+let R_QUALITY       = 0x2A
+let R_ROTATION      = 0x2B
+let R_AE_FREEZE     = 0x2C
+let R_AWB_FREEZE    = 0x2D
+let R_AUTO          = 0x30
+let R_GAIN_HI       = 0x31
+let R_GAIN_LO       = 0x32
+let R_EXPOSURE_HI   = 0x33
+let R_EXPOSURE_MID  = 0x34
+let R_EXPOSURE_LO   = 0x35
+let R_BURST         = 0x3C
+let R_SENSOR_ID     = 0x40
+let R_YEAR          = 0x41
+let R_MONTH         = 0x42
+let R_DAY           = 0x43
+let R_STATE         = 0x44
+let R_SIZE_LO       = 0x45
+let R_SIZE_MID      = 0x46
+let R_SIZE_HI       = 0x47
+let R_VERSION       = 0x49
 
 // The bits and values the registers take.
-let WRITE_BIT = 0x80
-let RESET_LOGIC = 0x40
-let FIFO_CLEAR_DONE = 0x01
-let FIFO_START = 0x02
-let STATE_IDLE_MASK = 0x03
-let STATE_IDLE = 0x02
-let STATE_CAP_DONE = 0x04
-let STATE_BUSY = 0x08
-let AUTO_ON = 0x80
+let WRITE_BIT          = 0x80
+let RESET_LOGIC        = 0x40
+let FIFO_CLEAR_DONE    = 0x01
+let FIFO_START         = 0x02
+let STATE_IDLE_MASK    = 0x03
+let STATE_IDLE         = 0x02
+let STATE_CAP_DONE     = 0x04
+let STATE_BUSY         = 0x08
+let AUTO_ON            = 0x80
 let POWER_SLEEP_LEGACY = 0x07
-let POWER_RUN_LEGACY = 0x05
-let SENSOR_I2C_ADDR = 0x78
+let POWER_RUN_LEGACY   = 0x05
+let SENSOR_I2C_ADDR    = 0x78
 
 // The waits.  The module's sensor bus is polled every 2 ms, as Zephyr's
 // driver does: 100 polls for a register write, 600 (1.2 s) for a reset,
 // 1000 (2 s) for a capture.
-let POLL_MS = 2
-let IDLE_TRIES = 100
-let RESET_TRIES = 600
+let POLL_MS       = 2
+let IDLE_TRIES    = 100
+let RESET_TRIES   = 600
 let CAPTURE_TRIES = 1000
 
 // The SPI clock the note recommends, and its mode.
-let SPI_HZ = 8000000
+let SPI_HZ   = 8000000
 let SPI_MODE = 0
 
 // The most bytes `read_chunk` moves in one burst.
@@ -363,17 +363,17 @@ pub fn res_supported(id: Int, res: Int) -> Bool
 // 2592x1944 9.  A size the legacy modules do not have answers -1.
 pub fn legacy_res_code(res: Int) -> Int
     match res
-        0 => 10
-        1 => 11
-        3 => 1
-        4 => 12
-        5 => 2
-        8 => 4
+        0  => 10
+        1  => 11
+        3  => 1
+        4  => 12
+        5  => 2
+        8  => 4
         10 => 6
         11 => 7
         12 => 8
         13 => 9
-        _ => -1
+        _  => -1
 
 // The code written to register 0x21 for a size on a module.
 pub fn res_code(id: Int, res: Int) -> Int
@@ -385,40 +385,40 @@ pub fn res_code(id: Int, res: Int) -> Int
 // is none.
 pub fn res_width(res: Int) -> Int
     match res
-        0 => 96
-        1 => 128
-        2 => 160
-        3 => 320
-        4 => 320
-        5 => 640
-        6 => 800
-        7 => 1024
-        8 => 1280
-        9 => 1280
+        0  => 96
+        1  => 128
+        2  => 160
+        3  => 320
+        4  => 320
+        5  => 640
+        6  => 800
+        7  => 1024
+        8  => 1280
+        9  => 1280
         10 => 1600
         11 => 1920
         12 => 2048
         13 => 2592
-        _ => 0
+        _  => 0
 
 // The height of a `RES_` value in pixels, 0 for a value that is none.
 pub fn res_height(res: Int) -> Int
     match res
-        0 => 96
-        1 => 128
-        2 => 120
-        3 => 240
-        4 => 320
-        5 => 480
-        6 => 600
-        7 => 768
-        8 => 720
-        9 => 1024
+        0  => 96
+        1  => 128
+        2  => 120
+        3  => 240
+        4  => 320
+        5  => 480
+        6  => 600
+        7  => 768
+        8  => 720
+        9  => 1024
         10 => 1200
         11 => 1080
         12 => 1536
         13 => 1944
-        _ => 0
+        _  => 0
 
 // Whether the module takes the special effect code `fx`: 0 to 6 on all,
 // 9 on the 3 MP (the SDK's mask has 7 and 8 on none).
@@ -500,7 +500,8 @@ pub fn spi_reg_read<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, reg
 
 // Writes `v` to the register `reg`: the register with bit 7 set and the
 // value, in one window: whether it ran.
-pub fn spi_reg_write<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, reg: Int, v: Int) -> Bool [hw]
+pub fn spi_reg_write<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, reg: Int,
+                                            v: Int) -> Bool [hw]
     var tx: DevBytes = Vec.new()
     let _ = tx.push(((reg & 0x7F) | WRITE_BIT) as u8)
     let _ = tx.push((v & 0xFF) as u8)

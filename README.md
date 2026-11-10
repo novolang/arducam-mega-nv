@@ -81,7 +81,7 @@ probe-rs run --chip nRF52840_xxAA main.elf
 
 The numbers are from the build's memory report. Flash also holds the runtime, the compiler's support library and the program's tables. The arena, 65,536 B on both boards, is the runtime's heap and is reserved whether or not the program uses it; the driver allocates nothing in it. The driver's state is an `Arducam` value of 152 bytes and the chunk buffer a `MegaChunk` of 264 bytes, both in the program's frame.
 
-Neither Nordic board package names a driver for its SPI peripheral (`@hal(spi)`), so `BoardSpi` is absent hardware on both: every transfer is refused or answers nothing, and the program prints `no answer from the camera`. The feature `features/embedded-devex/nordic-twim-i2c-driver.md` in the novo-lang repository tracks the missing Nordic bus drivers. The wiring when a bus exists: SCK, MOSI and MISO to the board's first SPI bus, CS to a free GPIO pin, which the wiring record names, and the module's supply to 3.3 V.
+Neither Nordic board package names a driver for its SPI peripheral (`@hal(spi)`), so `BoardSpi` is absent hardware on both: every transfer is refused or answers nothing, and the program prints `no answer from the camera`. The novo-lang repository tracks the missing Nordic bus drivers. The wiring when a bus exists: SCK, MOSI and MISO to the board's first SPI bus, CS to a free GPIO pin, which the wiring record names, and the module's supply to 3.3 V.
 
 ### The effects
 

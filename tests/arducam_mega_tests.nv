@@ -311,7 +311,13 @@ fn dut(c: Cam) -> Dut
 // The state with the sleep flag set.
 @tier(app)
 fn slept(st: MegaState) -> MegaState
-    MegaState { model: st.model, format: st.format, res: st.res, first: st.first, total: st.total, left: st.left, asleep: true }
+    MegaState { model: st.model,
+        format: st.format,
+        res: st.res,
+        first: st.first,
+        total: st.total,
+        left: st.left,
+        asleep: true }
 
 // ── The recorded picture ─────────────────────────────────────────────
 
@@ -623,7 +629,14 @@ fn test_a_capture_clears_the_flag_starts_polls_and_reads_the_length() [io, hw]
     c.st.insert(5, 2)
     test.assert(arducam_mega.frame_capture(d, var st))
     var want: [Int] = []
-    for part in [wr_log(0x04, 1), wr_log(0x04, 2), rd_log(0x44), rd_log(0x44), rd_log(0x44), rd_log(0x45), rd_log(0x46), rd_log(0x47)]
+    for part in [wr_log(0x04, 1),
+    wr_log(0x04, 2),
+    rd_log(0x44),
+    rd_log(0x44),
+    rd_log(0x44),
+    rd_log(0x45),
+    rd_log(0x46),
+    rd_log(0x47)]
         for v in part
             list.push(want, v)
     log_is(c, want)
@@ -1422,7 +1435,11 @@ fn test_the_board_type_over_absent_hardware() [io, hw]
 fn test_the_board_type_with_a_state_that_is_up_reaches_the_bus() [io, hw]
     let w = DeviceWiring { bus: 0, addr: None, cs: None, irq: None, en: None }
     let up = MegaState { model: 0x85, format: 1, res: 5, first: true, total: 10, left: 10, asleep: false }
-    var cam = Arducam { link: MegaLink { bus: BoardSpi { id: 0 }, timer: BoardTimer { id: 0 }, pins: BoardGpio { id: 0 }, w: w }, st: up }
+    var cam = Arducam { link: MegaLink { bus: BoardSpi { id: 0 },
+        timer: BoardTimer { id: 0 },
+        pins: BoardGpio { id: 0 },
+        w: w },
+    st: up }
     test.assert_eq(cam.frame_len(), 10)
     test.assert_eq(cam.frame_left(), 10)
     test.assert(not cam.configure(arducam_mega.FMT_RGB565, 5))
