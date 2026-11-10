@@ -1,0 +1,29 @@
+[package]
+name        = "arducam-mega-nv"
+version     = "0.1.0"
+description = "A driver for Arducam's Mega 3 MP and 5 MP SPI camera modules: the SPI register protocol, the capture sequence for JPEG, RGB565 and YUV pictures, the FIFO read in chunks the caller sizes with the JPEG start and end markers found for them, the image controls the Arducam SDK exposes, the low-power mode, and a host-side helper that writes a captured JPEG to a file."
+license     = "Apache-2.0"
+stability   = "experimental"
+category    = "embedded"
+layer       = "host"
+tags        = ["arducam", "arducam-mega", "camera", "image-sensor", "jpeg", "spi", "sensor", "nrf52840-dk", "nrf54lm20-dk"]
+repository  = "https://github.com/novolang/arducam-mega-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.24.0"
+
+# The package is checked at the embedded tier, the strictest one, so every
+# function in it is also valid at rt and system.  The host helper module
+# `mega_file` carries its own `@tier(app)`.
+[tier]
+tier = "embedded"
+
+[docs.pages]
+"README.md" = "Capturing a JPEG from an Arducam Mega camera in a device program"
+
+[dependencies]
+# The board's SPI bus, GPIO and timer handles, and the SpiBus, GpioOut and
+# Timer traits they implement.
+embedded-hal-nv = "^0.3.2"
+# The wiring record a board's device table hands `attach`, and the buffers
+# of the SPI helpers.
+devices-nv      = "^0.3.2"

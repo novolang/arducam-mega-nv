@@ -1,0 +1,60 @@
+// mega_file — the host side: trimming a captured JPEG to its markers and
+// writing it to a file.
+//
+// This module is for a program on a computer, which reads the bytes a
+// device sent over a serial line or a log, and not for the device: it
+// builds lists and writes files, so it is checked at the `app` tier and the
+// rest of the package is checked at `embedded`.
+
+// The picture inside `data`: from the first FF D8 to the first FF D9 after
+// it, both included.  The whole of `data` when it has no start marker, and
+// up to its end when it has no end marker.  The FIFO of the module is read
+// for its reported length, which can be longer than the picture, so a file
+// written from `data` as it is carries trailing bytes.
+@tier(app)
+pub fn jpeg_trim(data: [Int]) -> [Int]
+    var from = -1
+    var upto = data.len()
+    var last = -1
+    for i in 0..data.len()
+        let b = data[i]
+        if from < 0
+            if last == 0xFF and b == 0xD8
+                from = i - 1
+        elif last == 0xFF and b == 0xD9
+            upto = i + 1
+            break
+        last = b
+    if from < 0
+        return data[:]
+    var out: [Int] = []
+    for i in from..upto
+        list.push(out, data[i])
+    out
+
+// Writes `data` to the open file `fd` from offset 0 and flushes it: whether
+// both worked.
+@tier(app)
+pub fn jpeg_put(fd: Int, data: [Int]) -> Bool [fs]
+    match fs.write_at(fd, 0, data)
+        Some(_) => false
+        None => fs.fsync(fd)
+
+// Writes `data` to `path`, replacing the file: whether it was written and
+// flushed.  `fs.open_write` never truncates, so a file left by an earlier,
+// longer picture is deleted first, which is the fix for a file that ends in
+// the tail of the previous one.
+@tier(app)
+pub fn jpeg_write(path: Str, data: [Int]) -> Bool [fs]
+    if fs.exists(path)
+        if not fs.delete(path)
+            return false
+    let Some(fd) = fs.open_write(path) else return false
+    let ok = jpeg_put(fd, data)
+    fs.close(fd)
+    ok
+
+// Trims `data` and writes it: whether the file was written.
+@tier(app)
+pub fn jpeg_save(path: Str, data: [Int]) -> Bool [fs]
+    jpeg_write(path, jpeg_trim(data))

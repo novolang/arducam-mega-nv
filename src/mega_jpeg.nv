@@ -1,0 +1,84 @@
+// mega_jpeg — finding the start and the end of a JPEG in the chunks a
+// capture is read in.
+//
+// A JPEG file starts with the marker FF D8 (SOI) and ends with FF D9
+// (EOI), and inside the entropy-coded data every FF is followed by 00, so
+// FF D9 cannot occur there: the first FF D9 after the start is the end.  The
+// Mega's FIFO length can exceed the picture (the `arducam-mega` Rust crate
+// found trailing zeros), so the length the module reports is the most the
+// picture can be, and the end marker is where it stops.
+//
+// The scan carries on across chunks.  A marker may be split between two
+// chunks, FF at the end of one and D8 or D9 at the start of the next, so the
+// state holds the last byte.  After each chunk the scan says which bytes of
+// it belong to the picture: the bytes `lo` up to but not including `hi` of
+// the chunk, and, when the FF of the start marker was the last byte of the
+// chunk before, one more 0xFF (`lead`) to write first.  A caller that
+// writes the picture out writes `lead` times 0xFF and then those bytes.
+//
+// The scan holds no buffer and allocates nothing.  Offsets count bytes
+// from the start of the FIFO.
+
+use arducam_mega.{ MegaChunk }
+
+// The scan's state, and the answer for the last chunk: `at` is the offset
+// of the next byte, `last` the byte before it (-1 at the start), `start`
+// the offset of the FF of the start marker and `end` the offset one past
+// the D9 of the end marker, each -1 until found.
+pub @value
+struct JpegScan
+    at: Int
+    last: Int
+    start: Int
+    end: Int
+    lo: Int
+    hi: Int
+    lead: Int
+
+// A scan at the start of a capture.
+pub fn scan_new() -> JpegScan
+    JpegScan { at: 0, last: -1, start: -1, end: -1, lo: 0, hi: 0, lead: 0 }
+
+// Scans the first `n` bytes of `chunk`, the next bytes of the stream.
+pub fn scan_feed(var s: JpegScan, chunk: MegaChunk, n: Int)
+    s.lo = 0
+    s.hi = 0
+    s.lead = 0
+    var inside = s.start >= 0 and s.end < 0
+    var count = n
+    if count > chunk.len()
+        count = chunk.len()
+    for i in 0..count
+        let b = chunk[i] as Int
+        if s.start < 0
+            if s.last == 0xFF and b == 0xD8
+                s.start = s.at + i - 1
+                inside = true
+                if i == 0
+                    s.lead = 1
+                else
+                    s.lo = i - 1
+        elif s.end < 0
+            if s.last == 0xFF and b == 0xD9
+                s.end = s.at + i + 1
+                s.hi = i + 1
+                inside = false
+        s.last = b
+    if inside
+        s.hi = count
+    s.at = s.at + count
+
+// Whether the start marker has been seen.
+pub fn scan_started(s: JpegScan) -> Bool
+    s.start >= 0
+
+// Whether the end marker has been seen, which is when the picture is whole.
+pub fn scan_done(s: JpegScan) -> Bool
+    s.end >= 0
+
+// The length of the picture in bytes, from the FF of the start to the D9 of
+// the end, or -1 while either is missing.
+pub fn scan_length(s: JpegScan) -> Int
+    if s.start < 0 or s.end < 0
+        return -1
+    s.end - s.start

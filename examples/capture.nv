@@ -1,0 +1,92 @@
+// capture — takes a JPEG with an Arducam Mega camera and prints its length,
+// for an nRF52840 DK or an nRF54LM20 DK.
+//
+// The module's SCK, MOSI and MISO go to the board's first SPI bus, its CS
+// to the GPIO pin 28, and its power to 3.3 V and ground.  The program waits
+// half a second for the module to start, brings it up, sets JPEG at
+// 640x480, and then once a second takes a picture, reads it from the FIFO
+// in chunks of 64 bytes while it looks for the JPEG's start and end
+// markers, and prints over the board's UART:
+//
+//     model 133
+//     fifo 11264
+//     jpeg 11250 bytes
+//
+// `model` is the sensor ID byte in decimal (133 is 0x85), `fifo` the length
+// the module reports and `jpeg` the length between the markers, which can
+// be shorter.
+//
+// Build it with `novo build --target=nrf52840-dk examples/capture.nv` from a
+// package that depends on this one, or with `tests/device_build.sh`.
+
+use embedded_hal.{ BoardSpi, BoardGpio, BoardTimer }
+use dev_bus
+use arducam_mega
+use arducam_mega.{ Arducam, MegaChunk }
+use mega_jpeg
+
+// The chip-select pin, the bytes read in one burst, and the most bursts a
+// picture can take: the FIFO is 8 MB, which is 131,072 bursts of 64 bytes.
+const CS_PIN = 28
+const CHUNK = 64
+const MAX_CHUNKS = 131072
+
+// Writes `n`, 0 or more, in decimal.  Formatting into a string would
+// allocate, which @tier(embedded) refuses, so each digit goes out as a
+// byte.  An Int has at most 19 decimal digits, which bounds both loops.
+@tier(embedded)
+fn digits(n: Int) [hw]
+    var div = 1
+    for _k in 0..18
+        if div <= n / 10
+            div = div * 10
+    for _k in 0..19
+        if div > 0
+            hal.uart.write_byte(48 + (n / div) % 10)
+            div = div / 10
+
+// Writes a label, a number and a newline.
+@tier(embedded)
+fn line(label: Str, n: Int) [hw]
+    hal.uart.write(label)
+    digits(n)
+    hal.uart.write("\n")
+
+// Takes one picture and reports it.
+@tier(embedded)
+fn take(var cam: Arducam) [hw]
+    if not cam.capture()
+        hal.uart.write("capture failed\n")
+        return
+    line("fifo ", cam.frame_len())
+    var scan = mega_jpeg.scan_new()
+    var chunk: MegaChunk = Vec.new()
+    for _i in 0..MAX_CHUNKS
+        let n = cam.read_chunk(CHUNK, var chunk)
+        if n == 0
+            break
+        mega_jpeg.scan_feed(var scan, chunk, n)
+    let _ = cam.finish()
+    if mega_jpeg.scan_done(scan)
+        hal.uart.write("jpeg ")
+        digits(mega_jpeg.scan_length(scan))
+        hal.uart.write(" bytes\n")
+    else
+        hal.uart.write("no end marker\n")
+
+@tier(embedded)
+fn main() [hw]
+    bsp.board.init()
+    var cam = Arducam.attach(BoardSpi { id: 0 }, BoardTimer { id: 0 }, BoardGpio { id: 0 },
+                             dev_bus.wiring_spi(0, CS_PIN))
+    hal.timer.delay_ms(500)
+    if not cam.begin()
+        hal.uart.write("no answer from the camera\n")
+        return
+    line("model ", cam.model())
+    if not cam.configure(arducam_mega.FMT_JPEG, arducam_mega.RES_640X480)
+        hal.uart.write("format refused\n")
+        return
+    while true
+        take(var cam)
+        hal.timer.delay_ms(1000)

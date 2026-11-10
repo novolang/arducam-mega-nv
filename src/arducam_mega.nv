@@ -1,0 +1,1068 @@
+// arducam_mega — Arducam's Mega SPI camera modules, the 3 MP and the 5 MP
+// (and the 2 MP the SDK also lists), on an SPI bus: the register protocol,
+// the capture sequence, the FIFO read in chunks the caller sizes and the
+// image controls.
+//
+// The facts below are from three places.  Arducam's "Mega SPI Camera
+// Series Application Note" (September 2023) gives the SPI slave interface
+// (mode 0, 8 MHz recommended), the four bus cycles (single read, single
+// write, first burst read, Nth burst read) and the register table of
+// §4.  The registers the note leaves out (the sensor ID, the firmware date
+// and number, the sensor state and the FIFO length) and every sequence
+// are from Arducam's open C SDK, `ArduCAM/Arducam_Mega`, commit
+// 146e058b1b5e ("Update Arducam_Mega_SDK to V3", 2025-06-20), file
+// `src/Arducam/ArducamCamera.c`, SDK version 3.0.0, and where the two
+// disagree the site says which was taken.  Zephyr's
+// `drivers/video/video_arducam_mega.c` and the `arducam-mega` Rust crate
+// (unticks, 0.4.0) were read for their fixes; nothing is ported.
+//
+// The register map, as this driver uses it (all 8-bit; bit 7 of the
+// command byte is the write bit):
+//
+//   0x01  FRAMES              number of frames to take, value + 1
+//   0x02  POWER               bit 2 power enable, bit 1 sleep, bit 0 reset_n
+//                             (default 0x05); 0x07 sleeps a legacy module
+//   0x04  FIFO                bit 1 starts a capture, bit 0 clears the
+//                             capture-done flag
+//   0x07  RESET               bit 6 resets the module's logic
+//   0x0A  DEBUG_ADDR          I2C address of the image sensor, 0x78
+//   0x0B  DEBUG_REG_HI        high byte of a sensor register address
+//   0x0C  DEBUG_REG_LO        low byte of it
+//   0x0D  DEBUG_VAL_LO        low byte of the value to write
+//   0x0E  DEBUG_VAL_HI        high byte of it
+//   0x20  FORMAT              1 JPEG, 2 RGB565, 3 YUV
+//   0x21  RESOLUTION          bit 7 video mode, bits 6:0 the size code
+//   0x22  BRIGHTNESS          0 default, 1 +1, 2 -1, 3 +2, 4 -2, ... 8 -4
+//   0x23  CONTRAST            0 default, 1 +1, 2 -1, ... 6 -3
+//   0x24  SATURATION          the same as contrast
+//   0x25  EV                  exposure compensation, the same as contrast
+//   0x26  WHITE_BALANCE       0 auto, 1 daylight, 2 office, 3 cloudy, 4 indoor
+//   0x27  SPECIAL_EFFECT      0 none ... 6 greenish, 9 light yellow (3 MP)
+//   0x28  SHARPNESS           0 auto, 1 to 8 (legacy 3 MP); POWER_MODE on
+//                             the modules of the new family
+//   0x29  AUTO_FOCUS          0 to 4 (legacy 5 MP)
+//   0x2A  QUALITY             JPEG: 0 high, 1 medium, 2 low
+//   0x2B  ROTATION            0, or 1 for 180 degrees
+//   0x2C  AE_FREEZE, 0x2D AWB_FREEZE   (new family)
+//   0x30  AUTO                bit 7 on, bits 1:0: 0 gain, 1 exposure, 2 white
+//                             balance
+//   0x31/0x32  GAIN           bits 9:8, bits 7:0
+//   0x33/0x34/0x35  EXPOSURE  bits 19:16, 15:8, 7:0
+//   0x3C  burst FIFO read command; 0x3D single FIFO read command
+//   0x40  SENSOR_ID           0x81 to 0x87, see `model_*`
+//   0x41/0x42/0x43  firmware year (6 bits), month (4), day (5)
+//   0x44  STATE               bits 1:0 = 0b10 when the module's sensor bus is
+//                             idle, bit 2 capture done, bit 3 busy
+//   0x45/0x46/0x47  FIFO length, 24 bits, low byte first
+//   0x49  firmware number
+//
+// The SPI cycles (Application Note §3).  A register read is the command
+// byte (the register, bit 7 clear), one dummy byte and then the value:
+// three bytes in one chip-select window.  A write is the register with bit
+// 7 set and the value.  A burst read is 0x3C and then the FIFO bytes; the
+// first burst after a capture has one dummy byte between the command and
+// the data, the Nth burst (N >= 2) has none, and the FIFO read pointer
+// carries on where the last burst stopped.  The SDK keeps that in
+// `burstFirstFlag`; here it is `MegaState.first`.
+//
+// Pitfalls from the code read, each named again where it is kept:
+//
+//   - The SDK waits for the sensor bus to go idle and for the capture to
+//     finish without a limit, so a missing module hangs the caller; every
+//     wait here is bounded and answers `false`.  Zephyr bounds the capture
+//     wait and then reads the length anyway; this driver does not.
+//   - The SDK's capture wait breaks out at once while its low-power flag is
+//     set and reads a length before the capture is done; `frame_capture`
+//     refuses while the module sleeps.
+//   - The FIFO length can be larger than the JPEG (the Rust crate saw
+//     trailing zeros), so the picture ends at the first FF D9 and not at
+//     the length (see `mega_jpeg`).
+//   - The SDK indexes the OV3640 gain table with the caller's number and no
+//     check; `gain_set` refuses what the table does not hold.
+//   - The SDK's special-effect mask has a bit for "yellowish" with no code
+//     in its enum; the code, 9, is from the Application Note.
+//   - Zephyr accepts sensor IDs 0x81 to 0x84 only and refuses the three
+//     modules of the new family (0x85 to 0x87); the SDK's `cameraBegin` has
+//     no check and falls into the 5 MP row for an unknown ID.  This driver
+//     accepts exactly 0x81 to 0x87.
+//   - The Application Note's resolution codes (1 for 320x240 ... 12 for
+//     320x320) are the legacy codes; the SDK's own enumeration, 0 to 13, is
+//     the code of the new family, and `legacyMode` maps one to the other.
+
+use embedded_hal.{ BoardSpi, BoardGpio, BoardTimer, SpiBus, GpioOut }
+use dev_bus.{ DeviceWiring, DevBytes }
+
+// The registers.
+let R_POWER = 0x02
+let R_FIFO = 0x04
+let R_RESET = 0x07
+let R_DEBUG_ADDR = 0x0A
+let R_DEBUG_REG_HI = 0x0B
+let R_DEBUG_REG_LO = 0x0C
+let R_DEBUG_VAL_LO = 0x0D
+let R_DEBUG_VAL_HI = 0x0E
+let R_FORMAT = 0x20
+let R_RESOLUTION = 0x21
+let R_BRIGHTNESS = 0x22
+let R_CONTRAST = 0x23
+let R_SATURATION = 0x24
+let R_EV = 0x25
+let R_WHITE_BALANCE = 0x26
+let R_EFFECT = 0x27
+let R_SHARPNESS = 0x28
+let R_POWER_MODE = 0x28
+let R_FOCUS = 0x29
+let R_QUALITY = 0x2A
+let R_ROTATION = 0x2B
+let R_AE_FREEZE = 0x2C
+let R_AWB_FREEZE = 0x2D
+let R_AUTO = 0x30
+let R_GAIN_HI = 0x31
+let R_GAIN_LO = 0x32
+let R_EXPOSURE_HI = 0x33
+let R_EXPOSURE_MID = 0x34
+let R_EXPOSURE_LO = 0x35
+let R_BURST = 0x3C
+let R_SENSOR_ID = 0x40
+let R_YEAR = 0x41
+let R_MONTH = 0x42
+let R_DAY = 0x43
+let R_STATE = 0x44
+let R_SIZE_LO = 0x45
+let R_SIZE_MID = 0x46
+let R_SIZE_HI = 0x47
+let R_VERSION = 0x49
+
+// The bits and values the registers take.
+let WRITE_BIT = 0x80
+let RESET_LOGIC = 0x40
+let FIFO_CLEAR_DONE = 0x01
+let FIFO_START = 0x02
+let STATE_IDLE_MASK = 0x03
+let STATE_IDLE = 0x02
+let STATE_CAP_DONE = 0x04
+let STATE_BUSY = 0x08
+let AUTO_ON = 0x80
+let POWER_SLEEP_LEGACY = 0x07
+let POWER_RUN_LEGACY = 0x05
+let SENSOR_I2C_ADDR = 0x78
+
+// The waits.  The module's sensor bus is polled every 2 ms, as Zephyr's
+// driver does: 100 polls for a register write, 600 (1.2 s) for a reset,
+// 1000 (2 s) for a capture.
+let POLL_MS = 2
+let IDLE_TRIES = 100
+let RESET_TRIES = 600
+let CAPTURE_TRIES = 1000
+
+// The SPI clock the note recommends, and its mode.
+let SPI_HZ = 8000000
+let SPI_MODE = 0
+
+// The most bytes `read_chunk` moves in one burst.
+let CHUNK_MAX = 256
+
+// The OV3640 gain table of the SDK (`ov3640GainValue`): the register value
+// for the gain numbers 1 to 31 on the module with ID 0x82.
+const GAIN_3MP_1 = [
+    0x00, 0x10, 0x18, 0x30, 0x34, 0x38, 0x3b, 0x3f, 0x72, 0x74, 0x76,
+    0x78, 0x7a, 0x7c, 0x7e, 0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6,
+    0xf7, 0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff]
+
+// ── The names the SDK gives, as constants ────────────────────────────
+
+// The pixel format (register 0x20).
+
+// JPEG, compressed by the module itself.
+pub const FMT_JPEG = 1
+// RGB565, two bytes a pixel.
+pub const FMT_RGB565 = 2
+// YUV, which the Zephyr driver maps to YUYV.
+pub const FMT_YUV = 3
+
+// The sizes of the SDK's enumeration `CAM_IMAGE_MODE`, the code of the new
+// family; `legacy_res_code` maps them for the older modules.
+
+// 96x96.
+pub const RES_96X96 = 0
+// 128x128.
+pub const RES_128X128 = 1
+// 160x120.
+pub const RES_160X120 = 2
+// 320x240.
+pub const RES_320X240 = 3
+// 320x320.
+pub const RES_320X320 = 4
+// 640x480.
+pub const RES_640X480 = 5
+// 800x600.
+pub const RES_800X600 = 6
+// 1024x768.
+pub const RES_1024X768 = 7
+// 1280x720.
+pub const RES_1280X720 = 8
+// 1280x1024.
+pub const RES_1280X1024 = 9
+// 1600x1200.
+pub const RES_1600X1200 = 10
+// 1920x1080.
+pub const RES_1920X1080 = 11
+// 2048x1536, the largest size of the 3 MP.
+pub const RES_2048X1536 = 12
+// 2592x1944, the largest size of the 5 MP.
+pub const RES_2592X1944 = 13
+
+// The special effects (register 0x27): the SDK's `CAM_COLOR_FX` and, for
+// the 3 MP, the Application Note's code 9.  The SDK's name for 4 is sepia
+// and the note's is "yellowing"; it is one code.
+
+// No effect.
+pub const FX_NONE = 0
+// A cool tint (the SDK: blueish).
+pub const FX_BLUEISH = 1
+// A warm tint (the SDK: redish).
+pub const FX_REDISH = 2
+// Black and white.
+pub const FX_BW = 3
+// Sepia, which the Application Note calls yellowing.
+pub const FX_SEPIA = 4
+// The colours inverted.
+pub const FX_NEGATIVE = 5
+// A green tint (the SDK: grass green).
+pub const FX_GREENISH = 6
+// Over exposure, in the SDK's enumeration and in no module's mask.
+pub const FX_OVER_EXPOSURE = 7
+// Solarize, in the SDK's enumeration and in no module's mask.
+pub const FX_SOLARIZE = 8
+// Light yellow, code 9 of the 3 MP in the Application Note.
+pub const FX_LIGHT_YELLOW = 9
+
+// The white-balance modes (register 0x26).
+
+// Automatic white balance.
+pub const WB_AUTO = 0
+// Daylight (the SDK: sunny).
+pub const WB_DAYLIGHT = 1
+// Office lighting.
+pub const WB_OFFICE = 2
+// A cloudy day.
+pub const WB_CLOUDY = 3
+// Indoor lighting (the SDK: home).
+pub const WB_INDOOR = 4
+
+// The JPEG quality (register 0x2A).
+
+// High quality JPEG.
+pub const QUALITY_HIGH = 0
+// Medium quality JPEG.
+pub const QUALITY_MEDIUM = 1
+// Low quality JPEG.
+pub const QUALITY_LOW = 2
+
+// What register 0x30 switches between automatic and manual.
+
+// The automatic gain.
+pub const AUTO_GAIN = 0
+// The automatic exposure.
+pub const AUTO_EXPOSURE = 1
+// The automatic white balance.
+pub const AUTO_WHITE_BALANCE = 2
+
+// A buffer for one burst of the FIFO.
+pub alias MegaChunk = Vec[u8; 256]
+
+// ── The state a capture needs between calls ──────────────────────────
+//
+// The SDK keeps these in its camera record; a trait method gets a plain
+// `self`, so here the caller holds them and passes them `var`.  `model` is
+// the sensor ID read by `bring_up` and 0 before it; `format` is the last
+// format written, 0 for none; `res` the last size written, -1 for none;
+// `first` is true until the first burst of a capture has been read;
+// `total` and `left` are the FIFO bytes of the capture and the bytes not
+// yet read; `asleep` is the low-power flag.
+pub @value
+struct MegaState
+    model: Int
+    format: Int
+    res: Int
+    first: Bool
+    total: Int
+    left: Int
+    asleep: Bool
+
+// The state of a module nothing has been sent to.
+pub fn state_new() -> MegaState
+    MegaState { model: 0, format: 0, res: -1, first: true, total: 0, left: 0, asleep: false }
+
+// The firmware date and number the module reports.
+pub @value
+struct MegaVersion
+    year: Int
+    month: Int
+    day: Int
+    number: Int
+
+// ── The modules ──────────────────────────────────────────────────────
+//
+// The ID byte and what the SDK's tables say about it:
+//
+//   ID    module   family   SDK name       notes
+//   0x81  5 MP     legacy   SENSOR_5MP_1   autofocus, resolution codes 0x00-0x0C
+//   0x82  3 MP     legacy   SENSOR_3MP_1   sharpness, the OV3640 gain table
+//   0x83  5 MP     legacy   SENSOR_5MP_2   2592x1936 (Zephyr), wide limits
+//   0x84  3 MP     legacy   SENSOR_3MP_2   wide limits
+//   0x85  5 MP     new      SENSOR_5MP     14 sizes, AE and AWB freeze
+//   0x86  3 MP     new      SENSOR_3MP     13 sizes, AE and AWB freeze
+//   0x87  2 MP     new      SENSOR_2MP     11 sizes, AE and AWB freeze
+
+// Whether `id` is one of the seven the SDK lists.
+pub fn model_known(id: Int) -> Bool
+    id >= 0x81 and id <= 0x87
+
+// Whether the module is of the new family (0x85 to 0x87): the SDK's
+// enumeration is the size code, and the registers 0x28, 0x2C and 0x2D are
+// the power mode and the freezes.
+pub fn model_new(id: Int) -> Bool
+    id >= 0x85 and id <= 0x87
+
+// The megapixels the module is sold as: 5, 3 or 2; 0 for an unknown ID.
+pub fn model_megapixels(id: Int) -> Int
+    if id == 0x81 or id == 0x83 or id == 0x85
+        return 5
+    if id == 0x82 or id == 0x84 or id == 0x86
+        return 3
+    if id == 0x87
+        return 2
+    0
+
+// The sizes the module takes, one bit per `RES_` value (the SDK's
+// `supportResolution`, renumbered): the new 5 MP all 14, the new 3 MP the
+// first 13, the 2 MP the first 11, the legacy modules nine.
+pub fn model_res_mask(id: Int) -> Int
+    if id == 0x85
+        return 0x3FFF
+    if id == 0x86
+        return 0x1FFF
+    if id == 0x87
+        return 0x07FF
+    if id == 0x81 or id == 0x83
+        return 0x2D3B
+    if id == 0x82 or id == 0x84
+        return 0x1D3B
+    0
+
+// Whether the module takes the size `res`.
+pub fn res_supported(id: Int, res: Int) -> Bool
+    if res < 0 or res > 13
+        return false
+    ((model_res_mask(id) >> res) & 1) != 0
+
+// The legacy size code for a `RES_` value (the SDK's `legacyMode`; the
+// Application Note's table): 96x96 is 10, 128x128 11, 320x240 1, 320x320
+// 12, 640x480 2, 1280x720 4, 1600x1200 6, 1920x1080 7, 2048x1536 8 and
+// 2592x1944 9.  A size the legacy modules do not have answers -1.
+pub fn legacy_res_code(res: Int) -> Int
+    match res
+        0 => 10
+        1 => 11
+        3 => 1
+        4 => 12
+        5 => 2
+        8 => 4
+        10 => 6
+        11 => 7
+        12 => 8
+        13 => 9
+        _ => -1
+
+// The code written to register 0x21 for a size on a module.
+pub fn res_code(id: Int, res: Int) -> Int
+    if model_new(id)
+        return res
+    legacy_res_code(res)
+
+// The width and the height in pixels of a `RES_` value, 0 for a value that
+// is none.
+pub fn res_width(res: Int) -> Int
+    match res
+        0 => 96
+        1 => 128
+        2 => 160
+        3 => 320
+        4 => 320
+        5 => 640
+        6 => 800
+        7 => 1024
+        8 => 1280
+        9 => 1280
+        10 => 1600
+        11 => 1920
+        12 => 2048
+        13 => 2592
+        _ => 0
+
+// The height of a `RES_` value in pixels, 0 for a value that is none.
+pub fn res_height(res: Int) -> Int
+    match res
+        0 => 96
+        1 => 128
+        2 => 120
+        3 => 240
+        4 => 320
+        5 => 480
+        6 => 600
+        7 => 768
+        8 => 720
+        9 => 1024
+        10 => 1200
+        11 => 1080
+        12 => 1536
+        13 => 1944
+        _ => 0
+
+// Whether the module takes the special effect code `fx`: 0 to 6 on all,
+// 9 on the 3 MP (the SDK's mask has 7 and 8 on none).
+pub fn effect_supported(id: Int, fx: Int) -> Bool
+    if fx >= 0 and fx <= 6
+        return true
+    fx == 9 and model_megapixels(id) == 3
+
+// Whether the module has the sharpness register (the legacy 3 MP).
+pub fn model_sharpness(id: Int) -> Bool
+    id == 0x82 or id == 0x84
+
+// Whether it has autofocus (the legacy 5 MP).
+pub fn model_focus(id: Int) -> Bool
+    id == 0x81 or id == 0x83
+
+// Whether it can freeze auto exposure and auto white balance (the new
+// family).
+pub fn model_freeze(id: Int) -> Bool
+    model_new(id)
+
+// The manual exposure and gain limits (`CameraInfo`): the new family 1 to
+// 10000 and 0 to 240, the legacy modules 1 to 30000 and 1 to 1023, and the
+// two "_2" modules 0xFFFF for both maxima (`updateCameraInfo`).
+pub fn exposure_min(id: Int) -> Int
+    1
+
+// The largest manual exposure the module takes.
+pub fn exposure_max(id: Int) -> Int
+    if model_new(id)
+        return 10000
+    if id == 0x83 or id == 0x84
+        return 0xFFFF
+    30000
+
+// The smallest manual gain the module takes.
+pub fn gain_min(id: Int) -> Int
+    if model_new(id)
+        return 0
+    1
+
+// The largest manual gain the module takes; on the module with ID 0x82 the
+// largest index of the OV3640 table.
+pub fn gain_max(id: Int) -> Int
+    if model_new(id)
+        return 240
+    if id == 0x83 or id == 0x84
+        return 0xFFFF
+    if id == 0x82
+        return 31
+    1023
+
+// ── The bus ──────────────────────────────────────────────────────────
+//
+// A bus the module is on.  `setup` makes the bus and the pins ready and
+// answers whether the wiring suits it; `read_reg` reads one register (the
+// command, a dummy byte and the value, in one chip-select window);
+// `write_reg` writes one; `burst` reads `n` FIFO bytes after the burst
+// command, with the dummy byte first when `first` says this is the first
+// burst of the capture; `wait_ms` waits.
+pub trait MegaPort
+    fn setup(self) -> Bool [hw]
+    fn read_reg(self, reg: Int) -> ?Int [hw]
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+    fn burst(self, first: Bool, n: Int, var dst: MegaChunk) -> Bool [hw]
+    fn wait_ms(self, ms: Int) [hw]
+
+// Reads the register `reg`: the command byte with bit 7 clear, a dummy
+// byte and the value, with the clock held for the three.  The value is the
+// third byte; `None` for a wiring with no chip select.
+pub fn spi_reg_read<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, reg: Int) -> ?Int [hw]
+    var tx: DevBytes = Vec.new()
+    let _ = tx.push((reg & 0x7F) as u8)
+    let _ = tx.push(0 as u8)
+    var rx: DevBytes = Vec.new()
+    if not dev_bus.wiring_spi_exchange_fill_into(bus, gpio, w, tx, 1, 0, var rx)
+        return None
+    Some(rx[0] as Int)
+
+// Writes `v` to the register `reg`: the register with bit 7 set and the
+// value, in one window: whether it ran.
+pub fn spi_reg_write<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, reg: Int, v: Int) -> Bool [hw]
+    var tx: DevBytes = Vec.new()
+    let _ = tx.push(((reg & 0x7F) | WRITE_BIT) as u8)
+    let _ = tx.push((v & 0xFF) as u8)
+    var none: DevBytes = Vec.new()
+    dev_bus.wiring_spi_exchange_into(bus, gpio, w, tx, 0, var none)
+
+// Reads `n` bytes of the FIFO in one chip-select window: the burst command
+// 0x3C, one dummy byte when `first`, and the bytes, each clocked with 0x00.
+// `dst` is emptied first.  Whether it ran: a wiring with no chip select and
+// an `n` that `dst` does not hold answer `false` and drive no pin.
+pub fn spi_burst<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, first: Bool, n: Int,
+                                        var dst: MegaChunk) -> Bool [hw]
+    dst.clear()
+    let Some(cs) = w.cs else return false
+    if n > dst.capacity()
+        return false
+    gpio.set(cs, 0)
+    let _ = bus.transfer(R_BURST)
+    if first
+        let _ = bus.transfer(0)
+    for _i in 0..n
+        let _ = dst.push(bus.transfer(0) as u8)
+    gpio.set(cs, 1)
+    true
+
+// Makes the SPI bus ready: chip select driven high first and then an
+// output, so the module is never selected by accident; the bus at 8 MHz in
+// mode 0.  Answers whether the wiring has a chip select.
+pub fn spi_setup<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring) -> Bool [hw]
+    let Some(cs) = w.cs else return false
+    gpio.set(cs, 1)
+    gpio.mode(cs, 1)
+    bus.init(SPI_HZ, SPI_MODE)
+    true
+
+// ── Register access, with the waits bounded ──────────────────────────
+
+// One register, `None` when the bus did not answer.
+pub fn get<P: MegaPort>(p: P, reg: Int) -> ?Int [hw]
+    p.read_reg(reg)
+
+// Writes one register: whether the bus ran.
+pub fn put<P: MegaPort>(p: P, reg: Int, v: Int) -> Bool [hw]
+    p.write_reg(reg, v)
+
+// Waits for the module's sensor bus to go idle (STATE bits 1:0 = 0b10),
+// polling every 2 ms at most `tries` times.  A write to the sensor goes
+// out over a second bus inside the module, and the SDK waits after each
+// one; this waits as long.  Whether it came idle.
+//
+// Fix kept: the SDK's `cameraWaitI2cIdle` has no limit, which hangs a
+// caller whose module is not there or not powered.
+pub fn idle_wait<P: MegaPort>(p: P, tries: Int) -> Bool [hw]
+    for _i in 0..tries
+        let Some(s) = p.read_reg(R_STATE) else return false
+        if (s & STATE_IDLE_MASK) == STATE_IDLE
+            return true
+        p.wait_ms(POLL_MS)
+    false
+
+// Writes a register that reaches the sensor and waits for the sensor bus
+// to settle: whether both happened.
+fn ctl<P: MegaPort>(p: P, reg: Int, v: Int) -> Bool [hw]
+    if not p.write_reg(reg, v)
+        return false
+    idle_wait(p, IDLE_TRIES)
+
+// Waits for STATE bit 3 to clear, which the SDK does on the new family
+// after it switches an automatic mode; at most `IDLE_TRIES` polls.
+fn busy_wait<P: MegaPort>(p: P) -> Bool [hw]
+    for _i in 0..IDLE_TRIES
+        let Some(s) = p.read_reg(R_STATE) else return false
+        if (s & STATE_BUSY) == 0
+            return true
+        p.wait_ms(POLL_MS)
+    false
+
+// ── Bring-up ─────────────────────────────────────────────────────────
+
+// Brings the module up: the bus made ready; the module's logic reset
+// (register 0x07, bit 6) and the wait for its sensor bus to go idle, up
+// to 1.2 s; the sensor ID read and checked against the seven the SDK
+// lists; and the sensor's I2C address, 0x78, written to the debug-address
+// register as `cameraBegin` does.  `st` is reset first, since a reset puts
+// the format and the size back.  Answers whether the module answered as
+// one of the seven.  The caller has powered the module and waited; the
+// sources read give no figure for the wait.
+pub fn bring_up<P: MegaPort>(p: P, var st: MegaState) -> Bool [hw]
+    st = state_new()
+    if not p.setup()
+        return false
+    if not p.write_reg(R_RESET, RESET_LOGIC)
+        return false
+    if not idle_wait(p, RESET_TRIES)
+        return false
+    let Some(id) = p.read_reg(R_SENSOR_ID) else return false
+    if not model_known(id)
+        return false
+    if not ctl(p, R_DEBUG_ADDR, SENSOR_I2C_ADDR)
+        return false
+    st.model = id
+    true
+
+// The firmware date and number: the year in 6 bits, the month in 4, the
+// day in 5 and the number in 8, as the SDK masks them.  `None` when the bus
+// did not answer.
+pub fn firmware_version<P: MegaPort>(p: P) -> ?MegaVersion [hw]
+    let Some(y) = p.read_reg(R_YEAR) else return None
+    let Some(m) = p.read_reg(R_MONTH) else return None
+    let Some(d) = p.read_reg(R_DAY) else return None
+    let Some(n) = p.read_reg(R_VERSION) else return None
+    Some(MegaVersion { year: y & 0x3F, month: m & 0x0F, day: d & 0x1F, number: n & 0xFF })
+
+// The sensor ID byte, `None` when the bus did not answer.
+pub fn sensor_id<P: MegaPort>(p: P) -> ?Int [hw]
+    p.read_reg(R_SENSOR_ID)
+
+// Resets the module again and forgets what was set: whether it came idle.
+pub fn module_reset<P: MegaPort>(p: P, var st: MegaState) -> Bool [hw]
+    if not p.write_reg(R_RESET, RESET_LOGIC)
+        return false
+    st.format = 0
+    st.res = -1
+    st.total = 0
+    st.left = 0
+    st.first = true
+    st.asleep = false
+    idle_wait(p, RESET_TRIES)
+
+// ── Format and size ──────────────────────────────────────────────────
+
+// Sets the pixel format and the size.  Refused, with nothing sent, for a
+// module that has not been brought up, a sleeping module, a format that is
+// none of the three and a size the module does not take.  A format write
+// is followed by a size write, since the SDK rewrites the size after a
+// format change on the new family; a write that repeats what was set is
+// skipped.  Each write waits for the sensor bus.  Whether the module took
+// both.
+pub fn format_set<P: MegaPort>(p: P, var st: MegaState, fmt: Int, res: Int) -> Bool [hw]
+    if st.model == 0 or st.asleep
+        return false
+    if fmt < FMT_JPEG or fmt > FMT_YUV
+        return false
+    if not res_supported(st.model, res)
+        return false
+    if st.format != fmt
+        if not ctl(p, R_FORMAT, fmt)
+            return false
+        st.format = fmt
+        st.res = -1
+    if st.res != res
+        if not ctl(p, R_RESOLUTION, res_code(st.model, res))
+            return false
+        st.res = res
+    true
+
+// ── The capture ──────────────────────────────────────────────────────
+
+// Takes one picture and reads its length.  The sequence is the SDK's
+// `cameraSetCapture`: clear the capture-done flag (register 0x04, bit 0),
+// start (bit 1), poll STATE bit 2 every 2 ms, and read the FIFO length
+// from 0x45 to 0x47, low byte first, 24 bits.  Refused, with nothing sent,
+// before `bring_up` and `format_set` and while the module sleeps.  Answers
+// whether the capture finished within 2 s and left a length other than 0.
+//
+// Fix kept: the SDK waits for the flag without a limit, and its wait breaks
+// out at once when its low-power flag is set; Zephyr stops waiting after
+// 200 tries and reads the length of a capture that has not finished.  This
+// waits 1000 tries and answers `false` when the flag never came.
+pub fn frame_capture<P: MegaPort>(p: P, var st: MegaState) -> Bool [hw]
+    if st.model == 0 or st.asleep or st.format == 0 or st.res < 0
+        return false
+    st.total = 0
+    st.left = 0
+    st.first = true
+    if not p.write_reg(R_FIFO, FIFO_CLEAR_DONE)
+        return false
+    if not p.write_reg(R_FIFO, FIFO_START)
+        return false
+    var done = false
+    for _i in 0..CAPTURE_TRIES
+        let Some(s) = p.read_reg(R_STATE) else return false
+        if (s & STATE_CAP_DONE) != 0
+            done = true
+            break
+        p.wait_ms(POLL_MS)
+    if not done
+        return false
+    let Some(lo) = p.read_reg(R_SIZE_LO) else return false
+    let Some(mid) = p.read_reg(R_SIZE_MID) else return false
+    let Some(hi) = p.read_reg(R_SIZE_HI) else return false
+    let n = (hi << 16) | (mid << 8) | lo
+    if n == 0
+        return false
+    st.total = n
+    st.left = n
+    true
+
+// Reads up to `n` bytes of the capture into `dst`, which is emptied first,
+// and answers how many it took: 0 when none is left, for an `n` of 0 or
+// less, and when the burst did not run.  The count is cut to what is left
+// and to the 256 bytes of a `MegaChunk`.  The first call after a capture
+// reads the dummy byte; the later ones do not.
+//
+// Fix kept: the SDK's `cameraReadBuff` clocks the dummy byte only when its
+// flag says first, and the flag stays set if no byte was read, which is
+// what `first` does here when the burst fails.
+pub fn chunk_read<P: MegaPort>(p: P, var st: MegaState, n: Int, var dst: MegaChunk) -> Int [hw]
+    dst.clear()
+    if n <= 0 or st.left <= 0
+        return 0
+    var k = n
+    if k > st.left
+        k = st.left
+    if k > CHUNK_MAX
+        k = CHUNK_MAX
+    if not p.burst(st.first, k, var dst)
+        return 0
+    st.first = false
+    st.left = st.left - k
+    k
+
+// Ends a capture: clears the capture-done flag and forgets the length.
+// Whether the write ran.
+pub fn frame_end<P: MegaPort>(p: P, var st: MegaState) -> Bool [hw]
+    st.total = 0
+    st.left = 0
+    st.first = true
+    p.write_reg(R_FIFO, FIFO_CLEAR_DONE)
+
+// ── The image controls ───────────────────────────────────────────────
+
+// The code of a step of -`limit` to +`limit` for the brightness, contrast,
+// saturation and EV registers: 0 is the default, +1 is 1, -1 is 2, +2 is
+// 3, -2 is 4, and so on, odd for plus and even for minus.  A step beyond
+// the limit is cut to it.
+pub fn level_code(step: Int, limit: Int) -> Int
+    var s = step
+    if s > limit
+        s = limit
+    if s < 0 - limit
+        s = 0 - limit
+    if s > 0
+        return 2 * s - 1
+    if s < 0
+        return 0 - 2 * s
+    0
+
+// Sets the brightness, -4 to +4.
+pub fn brightness_set<P: MegaPort>(p: P, st: MegaState, step: Int) -> Bool [hw]
+    ready(st) and ctl(p, R_BRIGHTNESS, level_code(step, 4))
+
+// Sets the contrast, -3 to +3.
+pub fn contrast_set<P: MegaPort>(p: P, st: MegaState, step: Int) -> Bool [hw]
+    ready(st) and ctl(p, R_CONTRAST, level_code(step, 3))
+
+// Sets the saturation, -3 to +3.
+pub fn saturation_set<P: MegaPort>(p: P, st: MegaState, step: Int) -> Bool [hw]
+    ready(st) and ctl(p, R_SATURATION, level_code(step, 3))
+
+// Sets the exposure compensation (EV), -3 to +3.
+pub fn ev_set<P: MegaPort>(p: P, st: MegaState, step: Int) -> Bool [hw]
+    ready(st) and ctl(p, R_EV, level_code(step, 3))
+
+// Whether the module was brought up and is awake: the controls are
+// refused before and during sleep.
+fn ready(st: MegaState) -> Bool
+    st.model != 0 and not st.asleep
+
+// Sets the white-balance mode, one of the `WB_` values.
+pub fn white_balance_set<P: MegaPort>(p: P, st: MegaState, mode: Int) -> Bool [hw]
+    if not ready(st) or mode < WB_AUTO or mode > WB_INDOOR
+        return false
+    ctl(p, R_WHITE_BALANCE, mode)
+
+// Sets a special effect, one of the `FX_` values the module takes
+// (`effect_supported`).
+pub fn effect_set<P: MegaPort>(p: P, st: MegaState, fx: Int) -> Bool [hw]
+    if not ready(st) or not effect_supported(st.model, fx)
+        return false
+    ctl(p, R_EFFECT, fx)
+
+// Sets the JPEG quality, one of the `QUALITY_` values.
+pub fn quality_set<P: MegaPort>(p: P, st: MegaState, q: Int) -> Bool [hw]
+    if not ready(st) or q < QUALITY_HIGH or q > QUALITY_LOW
+        return false
+    ctl(p, R_QUALITY, q)
+
+// Turns the image 180 degrees, or back.
+pub fn rotation_set<P: MegaPort>(p: P, st: MegaState, turned: Bool) -> Bool [hw]
+    if not ready(st)
+        return false
+    var v = 0
+    if turned
+        v = 1
+    ctl(p, R_ROTATION, v)
+
+// Sets the sharpness, 0 (auto) to 8, on a module that has the register.
+pub fn sharpness_set<P: MegaPort>(p: P, st: MegaState, level: Int) -> Bool [hw]
+    if not ready(st) or not model_sharpness(st.model) or level < 0 or level > 8
+        return false
+    ctl(p, R_SHARPNESS, level)
+
+// Sets the autofocus mode, 0 to 4 (the Application Note: base
+// configuration, single, continuous, pause, off), on a module that has it.
+// Manual focus and the focus status go through the sensor's own registers
+// and are NOT IMPLEMENTED.
+pub fn focus_set<P: MegaPort>(p: P, st: MegaState, mode: Int) -> Bool [hw]
+    if not ready(st) or not model_focus(st.model) or mode < 0 or mode > 4
+        return false
+    ctl(p, R_FOCUS, mode)
+
+// Switches the automatic gain, exposure or white balance (`AUTO_`) on or
+// off.  On the new family the write is followed by the wait for STATE bit
+// 3 to clear, as the SDK does.
+//
+// Pitfall: the Rust crate reports pictures with a strong green cast when
+// the automatic white balance is on, on the 5 MP; this is not verified here.
+pub fn auto_set<P: MegaPort>(p: P, st: MegaState, which: Int, on: Bool) -> Bool [hw]
+    if not ready(st) or which < AUTO_GAIN or which > AUTO_WHITE_BALANCE
+        return false
+    var v = which
+    if on
+        v = v | AUTO_ON
+    if not ctl(p, R_AUTO, v)
+        return false
+    if model_new(st.model)
+        return busy_wait(p)
+    true
+
+// Sets the manual exposure (the module's own units; the sources read do not
+// give one) within `exposure_min` and `exposure_max`.  The SDK writes bits
+// 19:16 on the legacy modules only.
+pub fn exposure_set<P: MegaPort>(p: P, st: MegaState, v: Int) -> Bool [hw]
+    if not ready(st) or v < exposure_min(st.model) or v > exposure_max(st.model)
+        return false
+    if not model_new(st.model)
+        if not ctl(p, R_EXPOSURE_HI, (v >> 16) & 0xFF)
+            return false
+    if not ctl(p, R_EXPOSURE_MID, (v >> 8) & 0xFF)
+        return false
+    ctl(p, R_EXPOSURE_LO, v & 0xFF)
+
+// Sets the manual gain within `gain_min` and `gain_max`.  On the module
+// with ID 0x82 the number is an index, 1 to 31, into the SDK's OV3640
+// table.
+//
+// Fix kept: the SDK indexes that table with the caller's number unchecked.
+pub fn gain_set<P: MegaPort>(p: P, st: MegaState, v: Int) -> Bool [hw]
+    if not ready(st) or v < gain_min(st.model) or v > gain_max(st.model)
+        return false
+    var code = v
+    if st.model == 0x82
+        code = GAIN_3MP_1[v - 1]
+    if not ctl(p, R_GAIN_HI, (code >> 8) & 0x03)
+        return false
+    ctl(p, R_GAIN_LO, code & 0xFF)
+
+// Freezes or releases the automatic exposure, on the new family.
+pub fn ae_freeze_set<P: MegaPort>(p: P, st: MegaState, frozen: Bool) -> Bool [hw]
+    if not ready(st) or not model_freeze(st.model)
+        return false
+    var v = 0
+    if frozen
+        v = 1
+    ctl(p, R_AE_FREEZE, v)
+
+// Freezes or releases the automatic white balance, on the new family.
+pub fn awb_freeze_set<P: MegaPort>(p: P, st: MegaState, frozen: Bool) -> Bool [hw]
+    if not ready(st) or not model_freeze(st.model)
+        return false
+    var v = 0
+    if frozen
+        v = 1
+    ctl(p, R_AWB_FREEZE, v)
+
+// ── Low power ────────────────────────────────────────────────────────
+
+// Writes a 16-bit value to a 16-bit register of the image sensor through
+// the debug registers 0x0B, 0x0C, 0x0E and 0x0D, each write waiting for the
+// sensor bus.
+fn sensor_write16<P: MegaPort>(p: P, reg: Int, v: Int) -> Bool [hw]
+    if not ctl(p, R_DEBUG_REG_HI, (reg >> 8) & 0xFF)
+        return false
+    if not ctl(p, R_DEBUG_REG_LO, reg & 0xFF)
+        return false
+    if not ctl(p, R_DEBUG_VAL_HI, (v >> 8) & 0xFF)
+        return false
+    ctl(p, R_DEBUG_VAL_LO, v & 0xFF)
+
+// The three sensor writes that put the "_2" modules (0x83 and 0x84) to
+// sleep with `last` = 1 and wake them with `last` = 0 (the SDK's
+// `cameraLowPowerOn` and `cameraLowPowerOff`): 0x0028 = 0xD000, 0x002A =
+// 0x107E and 0x0F12 = `last`.
+fn sleep_sequence<P: MegaPort>(p: P, last: Int) -> Bool [hw]
+    if not sensor_write16(p, 0x0028, 0xD000)
+        return false
+    if not sensor_write16(p, 0x002A, 0x107E)
+        return false
+    sensor_write16(p, 0x0F12, last)
+
+// Puts the module in its low-power mode (`on`) or takes it out.  The
+// registers differ by module, as the SDK has them: the legacy modules 0x81
+// and 0x82 write register 0x02 (0x07 to sleep, 0x05 to run); 0x83 and 0x84
+// run the sensor writes of `sleep_sequence`; the new family writes register
+// 0x28 (1 or 0) and waits for the sensor bus.  Whether the module took it;
+// `st.asleep` follows.
+//
+// Zephyr writes register 0x02 for every module it knows and inverts the
+// value for 0x83 and 0x84, which the SDK does not: the two disagree, and
+// without a module to try this follows the SDK.  NOT VERIFIED.
+//
+// Fix kept: the capture and the controls are refused while `st.asleep`,
+// since the SDK's own capture loop gives up at once in that state.
+pub fn power_set<P: MegaPort>(p: P, var st: MegaState, on: Bool) -> Bool [hw]
+    if st.model == 0
+        return false
+    var ok = false
+    if model_new(st.model)
+        var v = 0
+        if on
+            v = 1
+        ok = ctl(p, R_POWER_MODE, v)
+    elif st.model == 0x83 or st.model == 0x84
+        var last = 0
+        if on
+            last = 1
+        ok = sleep_sequence(p, last)
+    else
+        var v = POWER_RUN_LEGACY
+        if on
+            v = POWER_SLEEP_LEGACY
+        ok = p.write_reg(R_POWER, v)
+    if ok
+        st.asleep = on
+    ok
+
+// ── The module on a board's SPI bus ──────────────────────────────────
+
+// The bus, the pin and the timer of a module: its `MegaPort`.
+pub @value
+struct MegaLink
+    bus: BoardSpi
+    timer: BoardTimer
+    pins: BoardGpio
+    w: DeviceWiring
+
+impl MegaPort for MegaLink
+    fn setup(self) -> Bool [hw]
+        spi_setup(self.bus, self.pins, self.w)
+
+    fn read_reg(self, reg: Int) -> ?Int [hw]
+        spi_reg_read(self.bus, self.pins, self.w, reg)
+
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        spi_reg_write(self.bus, self.pins, self.w, reg, v)
+
+    fn burst(self, first: Bool, n: Int, var dst: MegaChunk) -> Bool [hw]
+        spi_burst(self.bus, self.pins, self.w, first, n, var dst)
+
+    fn wait_ms(self, ms: Int) [hw]
+        self.timer.delay_ms(ms)
+
+// A module on a board: the link and the state.
+pub @value
+struct Arducam
+    link: MegaLink
+    st: MegaState
+
+impl Arducam
+    // The module with the chip select `w.cs` on the board's SPI bus, as a
+    // board's device table builds it.  Nothing is sent.
+    fn attach(bus: BoardSpi, timer: BoardTimer, pins: BoardGpio, w: DeviceWiring) -> Arducam
+        Arducam { link: MegaLink { bus: bus, timer: timer, pins: pins, w: w }, st: state_new() }
+
+    // Brings the module up (`bring_up`).
+    fn begin(var self) -> Bool [hw]
+        bring_up(self.link, var self.st)
+
+    // The sensor ID byte, the firmware date and number, and the model.
+    fn chip_id(self) -> ?Int [hw]
+        sensor_id(self.link)
+
+    fn firmware(self) -> ?MegaVersion [hw]
+        firmware_version(self.link)
+
+    fn model(self) -> Int
+        self.st.model
+
+    // The format and the size (`format_set`).
+    fn configure(var self, fmt: Int, res: Int) -> Bool [hw]
+        format_set(self.link, var self.st, fmt, res)
+
+    // One picture (`frame_capture`), the bytes the FIFO holds, the bytes
+    // not yet read, a chunk of them, and the end of the capture.
+    fn capture(var self) -> Bool [hw]
+        frame_capture(self.link, var self.st)
+
+    fn frame_len(self) -> Int
+        self.st.total
+
+    fn frame_left(self) -> Int
+        self.st.left
+
+    fn read_chunk(var self, n: Int, var dst: MegaChunk) -> Int [hw]
+        chunk_read(self.link, var self.st, n, var dst)
+
+    fn finish(var self) -> Bool [hw]
+        frame_end(self.link, var self.st)
+
+    fn reset(var self) -> Bool [hw]
+        module_reset(self.link, var self.st)
+
+    // Low power.
+    fn sleep(var self) -> Bool [hw]
+        power_set(self.link, var self.st, true)
+
+    fn wake(var self) -> Bool [hw]
+        power_set(self.link, var self.st, false)
+
+    // The image controls.
+    fn set_brightness(self, step: Int) -> Bool [hw]
+        brightness_set(self.link, self.st, step)
+
+    fn set_contrast(self, step: Int) -> Bool [hw]
+        contrast_set(self.link, self.st, step)
+
+    fn set_saturation(self, step: Int) -> Bool [hw]
+        saturation_set(self.link, self.st, step)
+
+    fn set_ev(self, step: Int) -> Bool [hw]
+        ev_set(self.link, self.st, step)
+
+    fn set_white_balance(self, mode: Int) -> Bool [hw]
+        white_balance_set(self.link, self.st, mode)
+
+    fn set_effect(self, fx: Int) -> Bool [hw]
+        effect_set(self.link, self.st, fx)
+
+    fn set_quality(self, q: Int) -> Bool [hw]
+        quality_set(self.link, self.st, q)
+
+    fn set_rotation(self, turned: Bool) -> Bool [hw]
+        rotation_set(self.link, self.st, turned)
+
+    fn set_sharpness(self, level: Int) -> Bool [hw]
+        sharpness_set(self.link, self.st, level)
+
+    fn set_focus(self, mode: Int) -> Bool [hw]
+        focus_set(self.link, self.st, mode)
+
+    fn set_auto(self, which: Int, on: Bool) -> Bool [hw]
+        auto_set(self.link, self.st, which, on)
+
+    fn set_exposure(self, v: Int) -> Bool [hw]
+        exposure_set(self.link, self.st, v)
+
+    fn set_gain(self, v: Int) -> Bool [hw]
+        gain_set(self.link, self.st, v)
+
+    fn freeze_ae(self, frozen: Bool) -> Bool [hw]
+        ae_freeze_set(self.link, self.st, frozen)
+
+    fn freeze_awb(self, frozen: Bool) -> Bool [hw]
+        awb_freeze_set(self.link, self.st, frozen)

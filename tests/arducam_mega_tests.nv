@@ -1,0 +1,1511 @@
+// arducam_mega_tests — the driver over a double of the module: a register
+// file and a FIFO behind an SPI slave that follows Arducam's Mega SPI
+// Camera Series Application Note (September 2023, §3) and the SDK's
+// capture sequence, so the command byte, the dummy byte, the burst reads,
+// the waits and the controls are checked on the host, one transaction at a
+// time.  The FIFO holds a JPEG made on the host (`tests/data`, 16x16, 304
+// bytes) and is not a recording of a camera.
+//
+// The double's state `st`:
+//   0 the byte index inside the SPI window    1 the command's register
+//   2 the cycle: 1 read, 2 write, 3 burst     3 1 when a module is there
+//   4 reads of STATE that still show busy     5 polls before a started
+//     capture is done                         6 1 while a capture runs
+//   7 the FIFO read pointer                   8 1 after the first burst
+//   9 1 inside an SPI window                  10 the SPI clock, 11 its mode
+//   12 the bytes the FIFO holds               13 the length reported
+//   14 the milliseconds waited                15 1 if a capture never ends
+//   17 1 if the sensor bus is never idle      18 the sensor ID
+//   20 reads of STATE that still show bit 3   21 1 when the done flag is set
+//   22 the busy reads a reset leaves          40 1 when this burst has a dummy
+//   41 the year, 42 the month, 43 the day, 44 the firmware number
+//   30 the register whose writes the port refuses, plus one; 34 the value
+//   it refuses, plus one, or 0 for any; 31 the register whose reads the
+//   port refuses, plus one; 32 1 if bursts are refused; 33 1 if setup is
+//   refused; 67 1 to keep no log; 99 the entries in the log.
+//
+// Log entries: an SPI window is 3, the bytes the controller clocked out,
+// -1.
+
+use std.test
+use embedded_hal.{ BoardSpi, BoardGpio, BoardTimer, SpiBus, GpioOut }
+use dev_bus.{ DeviceWiring, DevBytes }
+use arducam_mega
+use arducam_mega.{ MegaPort, MegaState, MegaChunk, MegaLink, MegaVersion, Arducam }
+use mega_jpeg
+use mega_jpeg.{ JpegScan }
+use mega_file
+
+// The chip select pin of the board's wiring.
+const CS = 7
+
+// ── The double ───────────────────────────────────────────────────────
+
+struct Cam
+    regs: HashMap<Int, Int>
+    st: HashMap<Int, Int>
+    fifo: HashMap<Int, Int>
+    log: HashMap<Int, Int>
+
+@tier(app)
+fn at(m: HashMap<Int, Int>, k: Int) -> Int
+    m.get(k) ?? 0
+
+// A module that is there, an ID of 0x85 and nothing in the FIFO.
+@tier(app)
+fn cam() -> Cam
+    let c = Cam { regs: HashMap.new(), st: HashMap.new(), fifo: HashMap.new(), log: HashMap.new() }
+    c.st.insert(3, 1)
+    c.st.insert(18, 0x85)
+    c.st.insert(41, 25)
+    c.st.insert(42, 2)
+    c.st.insert(43, 28)
+    c.st.insert(44, 3)
+    c
+
+@tier(app)
+fn log_push(c: Cam, v: Int)
+    if at(c.st, 67) == 1
+        return
+    let n = at(c.st, 99)
+    c.log.insert(n, v)
+    c.st.insert(99, n + 1)
+
+@tier(app)
+fn log_clear(c: Cam)
+    c.st.insert(99, 0)
+
+// Asserts the log holds exactly `want`, then empties it.
+@tier(app)
+fn log_is(c: Cam, want: [Int])
+    test.assert_eq(at(c.st, 99), want.len())
+    for i in 0..want.len()
+        test.assert_eq(at(c.log, i), want[i])
+    log_clear(c)
+
+// The window of a register read: the command, the dummy byte and the
+// filler of the one data byte.
+@tier(app)
+fn rd_log(reg: Int) -> [Int]
+    [3, reg, 0, 0, -1]
+
+// The window of a register write.
+@tier(app)
+fn wr_log(reg: Int, v: Int) -> [Int]
+    [3, reg | 0x80, v, -1]
+
+// The window of a burst of `n` bytes, with the dummy byte if `first`.
+@tier(app)
+fn burst_log(first: Bool, n: Int) -> [Int]
+    var out: [Int] = [3, 0x3C]
+    if first
+        list.push(out, 0)
+    for _i in 0..n
+        list.push(out, 0)
+    list.push(out, -1)
+    out
+
+// STATE (0x44) as the module answers it: bits 1:0 = 0b10 when the sensor
+// bus is idle, bit 2 once a capture has finished, bit 3 while busy.
+@tier(app)
+fn state_read(c: Cam) -> Int
+    if at(c.st, 6) == 1
+        if at(c.st, 15) == 0
+            if at(c.st, 5) > 0
+                c.st.insert(5, at(c.st, 5) - 1)
+            else
+                c.st.insert(6, 0)
+                c.st.insert(21, 1)
+    var v = 0
+    if at(c.st, 17) == 0
+        if at(c.st, 4) > 0
+            c.st.insert(4, at(c.st, 4) - 1)
+        else
+            v = 0x02
+    if at(c.st, 21) == 1
+        v = v | 0x04
+    if at(c.st, 20) > 0
+        c.st.insert(20, at(c.st, 20) - 1)
+        v = v | 0x08
+    v
+
+@tier(app)
+fn reg_read(c: Cam, r: Int) -> Int
+    if r == 0x44
+        return state_read(c)
+    if r == 0x40
+        return at(c.st, 18)
+    if r == 0x41
+        return at(c.st, 41) | 0xC0
+    if r == 0x42
+        return at(c.st, 42) | 0xF0
+    if r == 0x43
+        return at(c.st, 43) | 0xE0
+    if r == 0x49
+        return at(c.st, 44)
+    if r == 0x45
+        return at(c.st, 13) & 0xFF
+    if r == 0x46
+        return (at(c.st, 13) >> 8) & 0xFF
+    if r == 0x47
+        return (at(c.st, 13) >> 16) & 0xFF
+    at(c.regs, r)
+
+@tier(app)
+fn reg_write(c: Cam, r: Int, v: Int)
+    if r == 0x04
+        if (v & 1) != 0
+            c.st.insert(21, 0)
+        if (v & 2) != 0
+            c.st.insert(6, 1)
+            c.st.insert(7, 0)
+            c.st.insert(8, 0)
+            c.st.insert(21, 0)
+        return
+    if r == 0x07 and (v & 0x40) != 0
+        c.regs.clear()
+        c.st.insert(21, 0)
+        c.st.insert(6, 0)
+        c.st.insert(4, at(c.st, 22))
+        return
+    c.regs.insert(r, v)
+
+struct FakeSpi
+    c: Cam
+
+impl SpiBus for FakeSpi
+    @tier(app)
+    fn init(self, freq: Int, mode: Int) [hw]
+        self.c.st.insert(10, freq)
+        self.c.st.insert(11, mode)
+
+    @tier(app)
+    fn transfer(self, b: Int) -> Int [hw]
+        let c = self.c
+        if at(c.st, 9) == 1
+            log_push(c, b)
+        if at(c.st, 3) == 0
+            return 0xFF
+        let k = at(c.st, 0)
+        c.st.insert(0, k + 1)
+        if k == 0
+            if b == 0x3C
+                c.st.insert(2, 3)
+                if at(c.st, 8) == 0
+                    c.st.insert(40, 1)
+                else
+                    c.st.insert(40, 0)
+                c.st.insert(8, 1)
+            elif (b & 0x80) != 0
+                c.st.insert(2, 2)
+                c.st.insert(1, b & 0x7F)
+            else
+                c.st.insert(2, 1)
+                c.st.insert(1, b)
+            return 0xFF
+        let mode = at(c.st, 2)
+        if mode == 1
+            if k == 2
+                return reg_read(c, at(c.st, 1))
+            return 0xFF
+        if mode == 2
+            if k == 1
+                reg_write(c, at(c.st, 1), b)
+            return 0xFF
+        if k == 1 and at(c.st, 40) == 1
+            return 0xFF
+        let p = at(c.st, 7)
+        c.st.insert(7, p + 1)
+        at(c.fifo, p)
+
+    @tier(app)
+    fn write(self, data: [u8]) [hw]
+        for b in data
+            let _ = self.transfer(b as Int)
+
+    @tier(app)
+    fn read(self, n: Int) -> [u8] [hw]
+        var out: [u8] = []
+        for _i in 0..n
+            list.push(out, self.transfer(0xFF) as u8)
+        out
+
+// The GPIO double: the chip select falling opens a window, rising closes
+// it.
+struct FakePins
+    c: Cam
+    levels: HashMap<Int, Int>
+    modes: HashMap<Int, Int>
+
+impl GpioOut for FakePins
+    @tier(app)
+    fn mode(self, pin: Int, dir: Int) [hw]
+        self.modes.insert(pin, dir)
+
+    @tier(app)
+    fn set(self, pin: Int, val: Int) [hw]
+        self.levels.insert(pin, val)
+        if pin == CS and val == 0
+            self.c.st.insert(0, 0)
+            self.c.st.insert(9, 1)
+            log_push(self.c, 3)
+        if pin == CS and val == 1 and at(self.c.st, 9) == 1
+            self.c.st.insert(9, 0)
+            log_push(self.c, -1)
+
+    @tier(app)
+    fn get(self, pin: Int) -> Int [hw]
+        at(self.levels, pin)
+
+@tier(app)
+fn pins(c: Cam) -> FakePins
+    FakePins { c: c, levels: HashMap.new(), modes: HashMap.new() }
+
+@tier(app)
+fn wiring() -> DeviceWiring
+    dev_bus.wiring_spi(0, CS)
+
+// The port over the double, with the refusals the state keys 30 to 34 ask
+// for.
+struct Dut
+    bus: FakeSpi
+    pins: FakePins
+    w: DeviceWiring
+    c: Cam
+
+impl MegaPort for Dut
+    @tier(app)
+    fn setup(self) -> Bool [hw]
+        if at(self.c.st, 33) == 1
+            return false
+        arducam_mega.spi_setup(self.bus, self.pins, self.w)
+
+    @tier(app)
+    fn read_reg(self, reg: Int) -> ?Int [hw]
+        if at(self.c.st, 31) == reg + 1
+            return None
+        arducam_mega.spi_reg_read(self.bus, self.pins, self.w, reg)
+
+    @tier(app)
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        if at(self.c.st, 30) == reg + 1
+            if at(self.c.st, 34) == 0 or at(self.c.st, 34) == v + 1
+                return false
+        arducam_mega.spi_reg_write(self.bus, self.pins, self.w, reg, v)
+
+    @tier(app)
+    fn burst(self, first: Bool, n: Int, var dst: MegaChunk) -> Bool [hw]
+        if at(self.c.st, 32) == 1
+            dst.clear()
+            return false
+        arducam_mega.spi_burst(self.bus, self.pins, self.w, first, n, var dst)
+
+    @tier(app)
+    fn wait_ms(self, ms: Int) [hw]
+        self.c.st.insert(14, at(self.c.st, 14) + ms)
+
+@tier(app)
+fn dut(c: Cam) -> Dut
+    Dut { bus: FakeSpi { c: c }, pins: pins(c), w: wiring(), c: c }
+
+// The state with the sleep flag set.
+@tier(app)
+fn slept(st: MegaState) -> MegaState
+    MegaState { model: st.model, format: st.format, res: st.res, first: st.first, total: st.total, left: st.left, asleep: true }
+
+// ── The recorded picture ─────────────────────────────────────────────
+
+// The bytes of `tests/data/capture_16x16.jpg`.
+@tier(app)
+fn picture() -> [Int] [fs]
+    var out: [Int] = []
+    let Some(b) = fs.read_bytes("tests/data/capture_16x16.jpg") else return out
+    for i in 0..bytes.len(b)
+        list.push(out, bytes.byte_at(b, i) ?? 0)
+    out
+
+// Loads `data` into the FIFO, followed by `pad` zero bytes, and sets the
+// length the module reports to the whole.
+@tier(app)
+fn load(c: Cam, data: [Int], pad: Int)
+    for i in 0..data.len()
+        c.fifo.insert(i, data[i])
+    for i in 0..pad
+        c.fifo.insert(data.len() + i, 0)
+    c.st.insert(12, data.len() + pad)
+    c.st.insert(13, data.len() + pad)
+
+// A module brought up and set to JPEG at 640x480, with the log cleared:
+// the state `st` is what the driver holds.
+@tier(app)
+fn ready(d: Dut, var st: MegaState)
+    d.c.st.insert(67, 1)
+    test.assert(arducam_mega.bring_up(d, var st))
+    test.assert(arducam_mega.format_set(d, var st, arducam_mega.FMT_JPEG, arducam_mega.RES_640X480))
+    d.c.st.insert(67, 0)
+    log_clear(d.c)
+
+// ── The SPI framing ──────────────────────────────────────────────────
+
+@test
+fn test_a_register_read_is_the_command_a_dummy_byte_and_the_value() [io, hw]
+    let c = cam()
+    c.regs.insert(0x20, 0x01)
+    let d = dut(c)
+    test.assert_eq(arducam_mega.get(d, 0x20) ?? -1, 1)
+    log_is(c, rd_log(0x20))
+    // Bit 7 of the register is the write bit and is not part of a read.
+    test.assert_eq(arducam_mega.get(d, 0xA0) ?? -1, 1)
+    log_is(c, rd_log(0x20))
+
+@test
+fn test_a_register_write_sets_bit_7_of_the_command() [io, hw]
+    let c = cam()
+    let d = dut(c)
+    test.assert(arducam_mega.put(d, 0x22, 0x05))
+    log_is(c, wr_log(0x22, 0x05))
+    test.assert_eq(at(c.regs, 0x22), 5)
+    test.assert(arducam_mega.put(d, 0x23, 0x1FF))
+    log_is(c, wr_log(0x23, 0xFF))
+
+@test
+fn test_the_first_burst_has_a_dummy_byte_and_the_later_ones_have_none() [io, hw]
+    let c = cam()
+    let img = picture()
+    load(c, img, 0)
+    let d = dut(c)
+    var a: MegaChunk = Vec.new()
+    test.assert(arducam_mega.spi_burst(d.bus, d.pins, d.w, true, 4, var a))
+    log_is(c, burst_log(true, 4))
+    test.assert_eq(a.len(), 4)
+    for i in 0..4
+        test.assert_eq(a[i] as Int, img[i])
+    var b: MegaChunk = Vec.new()
+    test.assert(arducam_mega.spi_burst(d.bus, d.pins, d.w, false, 3, var b))
+    log_is(c, burst_log(false, 3))
+    for i in 0..3
+        test.assert_eq(b[i] as Int, img[4 + i])
+
+@test
+fn test_a_burst_that_does_not_fit_or_has_no_chip_select_is_not_run() [io, hw]
+    let c = cam()
+    let d = dut(c)
+    var a: MegaChunk = Vec.new()
+    test.assert(not arducam_mega.spi_burst(d.bus, d.pins, d.w, true, 257, var a))
+    test.assert_eq(at(c.st, 99), 0)
+    let nowire = dev_bus.wiring_i2c(0, 0x29)
+    test.assert(not arducam_mega.spi_burst(d.bus, d.pins, nowire, true, 4, var a))
+    test.assert(arducam_mega.spi_reg_read(d.bus, d.pins, nowire, 0x40) == None)
+    test.assert(not arducam_mega.spi_reg_write(d.bus, d.pins, nowire, 0x20, 1))
+    test.assert(not arducam_mega.spi_setup(d.bus, d.pins, nowire))
+    test.assert_eq(at(c.st, 99), 0)
+
+@test
+fn test_the_bus_is_set_up_with_chip_select_high_at_8_mhz_in_mode_0() [io, hw]
+    let c = cam()
+    let d = dut(c)
+    test.assert(arducam_mega.spi_setup(d.bus, d.pins, d.w))
+    test.assert_eq(at(d.pins.levels, CS), 1)
+    test.assert_eq(at(d.pins.modes, CS), 1)
+    test.assert_eq(at(c.st, 10), 8000000)
+    test.assert_eq(at(c.st, 11), 0)
+
+@test
+fn test_a_module_that_is_not_there_reads_0xff() [io, hw]
+    let c = cam()
+    c.st.insert(3, 0)
+    let d = dut(c)
+    test.assert_eq(arducam_mega.get(d, 0x40) ?? -1, 0xFF)
+
+// ── Bring-up ─────────────────────────────────────────────────────────
+
+@test
+fn test_bring_up_resets_waits_for_idle_reads_the_id_and_sets_the_sensor_address() [io, hw]
+    let c = cam()
+    let d = dut(c)
+    var st = arducam_mega.state_new()
+    test.assert(arducam_mega.bring_up(d, var st))
+    test.assert_eq(st.model, 0x85)
+    var want: [Int] = []
+    for part in [wr_log(0x07, 0x40), rd_log(0x44), rd_log(0x40), wr_log(0x0A, 0x78), rd_log(0x44)]
+        for v in part
+            list.push(want, v)
+    log_is(c, want)
+    test.assert_eq(at(c.st, 10), 8000000)
+    test.assert_eq(at(c.regs, 0x0A), 0x78)
+
+@test
+fn test_bring_up_waits_for_a_reset_that_leaves_the_sensor_bus_busy() [io, hw]
+    let c = cam()
+    c.st.insert(22, 5)
+    c.st.insert(67, 1)
+    let d = dut(c)
+    var st = arducam_mega.state_new()
+    test.assert(arducam_mega.bring_up(d, var st))
+    test.assert_eq(at(c.st, 14), 10)
+
+@test
+fn test_bring_up_accepts_the_seven_ids_and_refuses_the_rest() [io, hw]
+    for id in [0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87]
+        let c = cam()
+        c.st.insert(18, id)
+        c.st.insert(67, 1)
+        var st = arducam_mega.state_new()
+        test.assert(arducam_mega.bring_up(dut(c), var st))
+        test.assert_eq(st.model, id)
+        test.assert_eq(arducam_mega.sensor_id(dut(c)) ?? -1, id)
+    for id in [0x00, 0x80, 0x88, 0xFF]
+        let c = cam()
+        c.st.insert(18, id)
+        c.st.insert(67, 1)
+        var st = arducam_mega.state_new()
+        test.assert(not arducam_mega.bring_up(dut(c), var st))
+        test.assert_eq(st.model, 0)
+
+@test
+fn test_bring_up_gives_up_on_a_module_that_is_not_there_after_the_bounded_wait() [io, hw]
+    let c = cam()
+    c.st.insert(3, 0)
+    c.st.insert(67, 1)
+    var st = arducam_mega.state_new()
+    test.assert(not arducam_mega.bring_up(dut(c), var st))
+    test.assert_eq(at(c.st, 14), 1200)
+
+@test
+fn test_bring_up_stops_at_each_refusal_of_the_port() [io, hw]
+    var st = arducam_mega.state_new()
+    let c1 = cam()
+    c1.st.insert(33, 1)
+    test.assert(not arducam_mega.bring_up(dut(c1), var st))
+    let c2 = cam()
+    c2.st.insert(30, 0x07 + 1)
+    test.assert(not arducam_mega.bring_up(dut(c2), var st))
+    let c3 = cam()
+    c3.st.insert(31, 0x44 + 1)
+    test.assert(not arducam_mega.bring_up(dut(c3), var st))
+    let c4 = cam()
+    c4.st.insert(31, 0x40 + 1)
+    test.assert(not arducam_mega.bring_up(dut(c4), var st))
+    let c5 = cam()
+    c5.st.insert(30, 0x0A + 1)
+    test.assert(not arducam_mega.bring_up(dut(c5), var st))
+    test.assert_eq(st.model, 0)
+
+@test
+fn test_the_firmware_date_and_number_are_masked() [io, hw]
+    let c = cam()
+    let d = dut(c)
+    let v = arducam_mega.firmware_version(d)
+    test.assert(v == Some(MegaVersion { year: 25, month: 2, day: 28, number: 3 }))
+    c.st.insert(31, 0x41 + 1)
+    test.assert(arducam_mega.firmware_version(d) == None)
+    c.st.insert(31, 0x42 + 1)
+    test.assert(arducam_mega.firmware_version(d) == None)
+    c.st.insert(31, 0x43 + 1)
+    test.assert(arducam_mega.firmware_version(d) == None)
+    c.st.insert(31, 0x49 + 1)
+    test.assert(arducam_mega.firmware_version(d) == None)
+
+@test
+fn test_a_reset_forgets_the_format_and_the_size() [io, hw]
+    let c = cam()
+    let d = dut(c)
+    var st = arducam_mega.state_new()
+    ready(d, var st)
+    test.assert_eq(st.format, 1)
+    test.assert(arducam_mega.module_reset(d, var st))
+    test.assert_eq(st.format, 0)
+    test.assert_eq(st.res, -1)
+    test.assert_eq(st.model, 0x85)
+    log_is(c, [3, 0x87, 0x40, -1, 3, 0x44, 0, 0, -1])
+    c.st.insert(30, 0x07 + 1)
+    test.assert(not arducam_mega.module_reset(d, var st))
+
+// ── Format and size ──────────────────────────────────────────────────
+
+@test
+fn test_the_format_is_written_and_then_the_size() [io, hw]
+    let c = cam()
+    let d = dut(c)
+    var st = arducam_mega.state_new()
+    d.c.st.insert(67, 1)
+    test.assert(arducam_mega.bring_up(d, var st))
+    d.c.st.insert(67, 0)
+    log_clear(c)
+    test.assert(arducam_mega.format_set(d, var st, arducam_mega.FMT_JPEG, arducam_mega.RES_640X480))
+    var want: [Int] = []
+    for part in [wr_log(0x20, 1), rd_log(0x44), wr_log(0x21, 5), rd_log(0x44)]
+        for v in part
+            list.push(want, v)
+    log_is(c, want)
+
+@test
+fn test_a_repeated_setting_sends_nothing_and_a_format_change_rewrites_the_size() [io, hw]
+    let c = cam()
+    let d = dut(c)
+    var st = arducam_mega.state_new()
+    ready(d, var st)
+    test.assert(arducam_mega.format_set(d, var st, arducam_mega.FMT_JPEG, arducam_mega.RES_640X480))
+    test.assert_eq(at(c.st, 99), 0)
+    test.assert(arducam_mega.format_set(d, var st, arducam_mega.FMT_JPEG, arducam_mega.RES_320X240))
+    var want: [Int] = []
+    for part in [wr_log(0x21, 3), rd_log(0x44)]
+        for v in part
+            list.push(want, v)
+    log_is(c, want)
+    test.assert(arducam_mega.format_set(d, var st, arducam_mega.FMT_RGB565, arducam_mega.RES_320X240))
+    var want2: [Int] = []
+    for part in [wr_log(0x20, 2), rd_log(0x44), wr_log(0x21, 3), rd_log(0x44)]
+        for v in part
+            list.push(want2, v)
+    log_is(c, want2)
+    test.assert_eq(at(c.regs, 0x20), 2)
+
+@test
+fn test_the_legacy_modules_take_the_older_size_codes() [io, hw]
+    let c = cam()
+    c.st.insert(18, 0x82)
+    c.st.insert(67, 1)
+    let d = dut(c)
+    var st = arducam_mega.state_new()
+    test.assert(arducam_mega.bring_up(d, var st))
+    test.assert(arducam_mega.format_set(d, var st, arducam_mega.FMT_YUV, arducam_mega.RES_2048X1536))
+    test.assert_eq(at(c.regs, 0x21), 8)
+    test.assert(arducam_mega.format_set(d, var st, arducam_mega.FMT_YUV, arducam_mega.RES_96X96))
+    test.assert_eq(at(c.regs, 0x21), 10)
+    test.assert(arducam_mega.format_set(d, var st, arducam_mega.FMT_YUV, arducam_mega.RES_320X320))
+    test.assert_eq(at(c.regs, 0x21), 12)
+    // The legacy modules have no 1024x768.
+    test.assert(not arducam_mega.format_set(d, var st, arducam_mega.FMT_YUV, arducam_mega.RES_1024X768))
+    test.assert_eq(at(c.regs, 0x21), 12)
+
+@test
+fn test_a_setting_the_module_does_not_have_is_refused_before_anything_is_sent() [io, hw]
+    let c = cam()
+    c.st.insert(18, 0x86)
+    let d = dut(c)
+    var st = arducam_mega.state_new()
+    test.assert(not arducam_mega.format_set(d, var st, arducam_mega.FMT_JPEG, arducam_mega.RES_640X480))
+    ready(d, var st)
+    test.assert(not arducam_mega.format_set(d, var st, arducam_mega.FMT_JPEG, arducam_mega.RES_2592X1944))
+    test.assert(not arducam_mega.format_set(d, var st, arducam_mega.FMT_JPEG, -1))
+    test.assert(not arducam_mega.format_set(d, var st, arducam_mega.FMT_JPEG, 14))
+    test.assert(not arducam_mega.format_set(d, var st, 0, arducam_mega.RES_640X480))
+    test.assert(not arducam_mega.format_set(d, var st, 4, arducam_mega.RES_640X480))
+    st = slept(st)
+    test.assert(not arducam_mega.format_set(d, var st, arducam_mega.FMT_YUV, arducam_mega.RES_640X480))
+    test.assert_eq(at(c.st, 99), 0)
+
+@test
+fn test_a_refused_write_leaves_the_state_as_it_was() [io, hw]
+    let c = cam()
+    let d = dut(c)
+    var st = arducam_mega.state_new()
+    ready(d, var st)
+    c.st.insert(30, 0x20 + 1)
+    test.assert(not arducam_mega.format_set(d, var st, arducam_mega.FMT_RGB565, arducam_mega.RES_640X480))
+    test.assert_eq(st.format, 1)
+    c.st.insert(30, 0x21 + 1)
+    test.assert(not arducam_mega.format_set(d, var st, arducam_mega.FMT_RGB565, arducam_mega.RES_640X480))
+    test.assert_eq(st.format, 2)
+    test.assert_eq(st.res, -1)
+
+// ── The capture ──────────────────────────────────────────────────────
+
+@test
+fn test_a_capture_clears_the_flag_starts_polls_and_reads_the_length() [io, hw]
+    let c = cam()
+    let d = dut(c)
+    let img = picture()
+    load(c, img, 0)
+    var st = arducam_mega.state_new()
+    ready(d, var st)
+    c.st.insert(5, 2)
+    test.assert(arducam_mega.frame_capture(d, var st))
+    var want: [Int] = []
+    for part in [wr_log(0x04, 1), wr_log(0x04, 2), rd_log(0x44), rd_log(0x44), rd_log(0x44), rd_log(0x45), rd_log(0x46), rd_log(0x47)]
+        for v in part
+            list.push(want, v)
+    log_is(c, want)
+    test.assert_eq(st.total, img.len())
+    test.assert_eq(st.left, img.len())
+    test.assert(st.first)
+    test.assert_eq(at(c.st, 14), 4)
+
+@test
+fn test_the_length_is_24_bits() [io, hw]
+    let c = cam()
+    let d = dut(c)
+    c.st.insert(13, 0x7A1234)
+    var st = arducam_mega.state_new()
+    ready(d, var st)
+    test.assert(arducam_mega.frame_capture(d, var st))
+    test.assert_eq(st.total, 0x7A1234)
+
+@test
+fn test_a_capture_that_never_ends_is_given_up_after_2_seconds() [io, hw]
+    let c = cam()
+    let d = dut(c)
+    load(c, picture(), 0)
+    c.st.insert(15, 1)
+    var st = arducam_mega.state_new()
+    ready(d, var st)
+    test.assert(not arducam_mega.frame_capture(d, var st))
+    test.assert_eq(at(c.st, 14), 2000)
+    test.assert_eq(st.total, 0)
+
+@test
+fn test_a_capture_with_no_length_is_a_failure() [io, hw]
+    let c = cam()
+    let d = dut(c)
+    var st = arducam_mega.state_new()
+    ready(d, var st)
+    test.assert(not arducam_mega.frame_capture(d, var st))
+
+@test
+fn test_a_capture_is_refused_before_setup_and_while_asleep() [io, hw]
+    let c = cam()
+    let d = dut(c)
+    load(c, picture(), 0)
+    var st = arducam_mega.state_new()
+    test.assert(not arducam_mega.frame_capture(d, var st))
+    d.c.st.insert(67, 1)
+    test.assert(arducam_mega.bring_up(d, var st))
+    test.assert(not arducam_mega.frame_capture(d, var st))
+    test.assert(arducam_mega.format_set(d, var st, arducam_mega.FMT_JPEG, arducam_mega.RES_640X480))
+    st = slept(st)
+    test.assert(not arducam_mega.frame_capture(d, var st))
+    d.c.st.insert(67, 0)
+    log_clear(c)
+    test.assert(not arducam_mega.frame_capture(d, var st))
+    test.assert_eq(at(c.st, 99), 0)
+
+@test
+fn test_a_capture_stops_at_each_refusal_of_the_port() [io, hw]
+    let c = cam()
+    let d = dut(c)
+    load(c, picture(), 0)
+    var st = arducam_mega.state_new()
+    ready(d, var st)
+    c.st.insert(30, 0x04 + 1)
+    c.st.insert(34, 1 + 1)
+    test.assert(not arducam_mega.frame_capture(d, var st))
+    c.st.insert(34, 2 + 1)
+    test.assert(not arducam_mega.frame_capture(d, var st))
+    c.st.insert(30, 0)
+    c.st.insert(31, 0x44 + 1)
+    test.assert(not arducam_mega.frame_capture(d, var st))
+    c.st.insert(31, 0x45 + 1)
+    test.assert(not arducam_mega.frame_capture(d, var st))
+    c.st.insert(31, 0x46 + 1)
+    test.assert(not arducam_mega.frame_capture(d, var st))
+    c.st.insert(31, 0x47 + 1)
+    test.assert(not arducam_mega.frame_capture(d, var st))
+    test.assert_eq(st.total, 0)
+
+// Reads the whole capture in chunks of `k` and answers the bytes.
+@tier(app)
+fn read_all(d: Dut, var st: MegaState, k: Int) -> [Int] [hw]
+    var out: [Int] = []
+    var chunk: MegaChunk = Vec.new()
+    for _i in 0..5000
+        let n = arducam_mega.chunk_read(d, var st, k, var chunk)
+        if n == 0
+            break
+        test.assert_eq(chunk.len(), n)
+        for j in 0..n
+            list.push(out, chunk[j] as Int)
+    out
+
+@test
+fn test_the_recorded_picture_is_read_back_in_chunks_of_any_size() [io, hw]
+    let img = picture()
+    test.assert_eq(img.len(), 304)
+    for k in [1, 7, 63, 64, 100, 256, 1000]
+        let c = cam()
+        let d = dut(c)
+        load(c, img, 0)
+        var st = arducam_mega.state_new()
+        ready(d, var st)
+        test.assert(arducam_mega.frame_capture(d, var st))
+        let got = read_all(d, var st, k)
+        test.assert_eq(got.len(), img.len())
+        for i in 0..img.len()
+            test.assert_eq(got[i], img[i])
+        test.assert_eq(st.left, 0)
+        test.assert(not st.first)
+
+@test
+fn test_only_the_first_burst_of_a_capture_clocks_a_dummy_byte() [io, hw]
+    let c = cam()
+    let d = dut(c)
+    load(c, picture(), 0)
+    var st = arducam_mega.state_new()
+    ready(d, var st)
+    test.assert(arducam_mega.frame_capture(d, var st))
+    log_clear(c)
+    var chunk: MegaChunk = Vec.new()
+    test.assert_eq(arducam_mega.chunk_read(d, var st, 100, var chunk), 100)
+    log_is(c, burst_log(true, 100))
+    test.assert_eq(arducam_mega.chunk_read(d, var st, 100, var chunk), 100)
+    log_is(c, burst_log(false, 100))
+    test.assert_eq(arducam_mega.chunk_read(d, var st, 300, var chunk), 104)
+    log_is(c, burst_log(false, 104))
+    test.assert_eq(arducam_mega.chunk_read(d, var st, 10, var chunk), 0)
+    test.assert_eq(chunk.len(), 0)
+    test.assert_eq(at(c.st, 99), 0)
+    // A second capture starts with a dummy byte again.
+    test.assert(arducam_mega.frame_capture(d, var st))
+    log_clear(c)
+    test.assert_eq(arducam_mega.chunk_read(d, var st, 8, var chunk), 8)
+    log_is(c, burst_log(true, 8))
+
+@test
+fn test_a_chunk_is_cut_to_the_buffer_and_a_bad_count_reads_nothing() [io, hw]
+    let c = cam()
+    let d = dut(c)
+    load(c, picture(), 40)
+    var st = arducam_mega.state_new()
+    ready(d, var st)
+    var chunk: MegaChunk = Vec.new()
+    test.assert_eq(arducam_mega.chunk_read(d, var st, 10, var chunk), 0)
+    test.assert(arducam_mega.frame_capture(d, var st))
+    test.assert_eq(arducam_mega.chunk_read(d, var st, 0, var chunk), 0)
+    test.assert_eq(arducam_mega.chunk_read(d, var st, -5, var chunk), 0)
+    test.assert_eq(st.left, 344)
+    test.assert_eq(arducam_mega.chunk_read(d, var st, 1000, var chunk), 256)
+    test.assert_eq(st.left, 88)
+
+@test
+fn test_a_burst_that_fails_keeps_the_first_flag_and_the_count() [io, hw]
+    let c = cam()
+    let d = dut(c)
+    load(c, picture(), 0)
+    var st = arducam_mega.state_new()
+    ready(d, var st)
+    test.assert(arducam_mega.frame_capture(d, var st))
+    c.st.insert(32, 1)
+    var chunk: MegaChunk = Vec.new()
+    test.assert_eq(arducam_mega.chunk_read(d, var st, 50, var chunk), 0)
+    test.assert(st.first)
+    test.assert_eq(st.left, 304)
+    c.st.insert(32, 0)
+    test.assert_eq(arducam_mega.chunk_read(d, var st, 50, var chunk), 50)
+    test.assert_eq(chunk[0] as Int, 0xFF)
+    test.assert_eq(chunk[1] as Int, 0xD8)
+
+@test
+fn test_ending_a_capture_clears_the_flag() [io, hw]
+    let c = cam()
+    let d = dut(c)
+    load(c, picture(), 0)
+    var st = arducam_mega.state_new()
+    ready(d, var st)
+    test.assert(arducam_mega.frame_capture(d, var st))
+    test.assert_eq(at(c.st, 21), 1)
+    log_clear(c)
+    test.assert(arducam_mega.frame_end(d, var st))
+    log_is(c, wr_log(0x04, 1))
+    test.assert_eq(at(c.st, 21), 0)
+    test.assert_eq(st.left, 0)
+    test.assert_eq(st.total, 0)
+    c.st.insert(30, 0x04 + 1)
+    test.assert(not arducam_mega.frame_end(d, var st))
+
+// ── The JPEG markers ─────────────────────────────────────────────────
+
+// Reads the capture in chunks of `k`, scanning each, and answers the bytes
+// the scan says belong to the picture.
+@tier(app)
+fn scan_all(d: Dut, var st: MegaState, k: Int, var s: JpegScan) -> [Int] [hw]
+    var out: [Int] = []
+    var chunk: MegaChunk = Vec.new()
+    for _i in 0..5000
+        let n = arducam_mega.chunk_read(d, var st, k, var chunk)
+        if n == 0
+            break
+        mega_jpeg.scan_feed(var s, chunk, n)
+        for _j in 0..s.lead
+            list.push(out, 0xFF)
+        for j in s.lo..s.hi
+            list.push(out, chunk[j] as Int)
+    out
+
+@test
+fn test_the_scan_finds_the_markers_for_any_chunk_size_and_a_tail_of_zeros() [io, hw]
+    let img = picture()
+    for pad in [0, 1, 40]
+        for k in [1, 2, 3, 7, 63, 64, 255, 256]
+            let c = cam()
+            let d = dut(c)
+            load(c, img, pad)
+            var st = arducam_mega.state_new()
+            ready(d, var st)
+            test.assert(arducam_mega.frame_capture(d, var st))
+            var s = mega_jpeg.scan_new()
+            let got = scan_all(d, var st, k, var s)
+            test.assert(mega_jpeg.scan_started(s))
+            test.assert(mega_jpeg.scan_done(s))
+            test.assert_eq(s.start, 0)
+            test.assert_eq(s.end, img.len())
+            test.assert_eq(mega_jpeg.scan_length(s), img.len())
+            test.assert_eq(got.len(), img.len())
+            for i in 0..img.len()
+                test.assert_eq(got[i], img[i])
+
+@test
+fn test_a_picture_that_starts_after_some_bytes_is_cut_at_its_markers() [io, hw]
+    let img = picture()
+    var data: [Int] = [0, 0xFF, 0xFF, 0x12]
+    for b in img
+        list.push(data, b)
+    for b in [0xFF, 0xD8, 0, 0xFF, 0xD9]
+        list.push(data, b)
+    for k in [1, 5, 256]
+        let c = cam()
+        let d = dut(c)
+        load(c, data, 3)
+        var st = arducam_mega.state_new()
+        ready(d, var st)
+        test.assert(arducam_mega.frame_capture(d, var st))
+        var s = mega_jpeg.scan_new()
+        let got = scan_all(d, var st, k, var s)
+        test.assert_eq(s.start, 4)
+        test.assert_eq(s.end, 4 + img.len())
+        test.assert_eq(got.len(), img.len())
+        for i in 0..img.len()
+            test.assert_eq(got[i], img[i])
+
+@test
+fn test_a_stream_without_markers_has_no_picture() [io, hw]
+    var s = mega_jpeg.scan_new()
+    var chunk: MegaChunk = Vec.new()
+    for b in [1, 2, 0xFF, 0xD0, 0xD8, 0xD9]
+        let _ = chunk.push(b as u8)
+    mega_jpeg.scan_feed(var s, chunk, 6)
+    test.assert(not mega_jpeg.scan_started(s))
+    test.assert(not mega_jpeg.scan_done(s))
+    test.assert_eq(mega_jpeg.scan_length(s), -1)
+    test.assert_eq(s.lo, 0)
+    test.assert_eq(s.hi, 0)
+    test.assert_eq(s.at, 6)
+    // An end marker with no start before it is not an end.
+    var t = mega_jpeg.scan_new()
+    var c2: MegaChunk = Vec.new()
+    for b in [0xFF, 0xD9, 5]
+        let _ = c2.push(b as u8)
+    mega_jpeg.scan_feed(var t, c2, 3)
+    test.assert(not mega_jpeg.scan_done(t))
+    // A start with no end is a length of -1, and a count past the chunk is cut.
+    var u = mega_jpeg.scan_new()
+    var c3: MegaChunk = Vec.new()
+    for b in [7, 0xFF, 0xD8, 9]
+        let _ = c3.push(b as u8)
+    mega_jpeg.scan_feed(var u, c3, 99)
+    test.assert(mega_jpeg.scan_started(u))
+    test.assert_eq(mega_jpeg.scan_length(u), -1)
+    test.assert_eq(u.start, 1)
+    test.assert_eq(u.lo, 1)
+    test.assert_eq(u.hi, 4)
+    test.assert_eq(u.at, 4)
+    // Later chunks after the end are outside the picture.
+    var c4: MegaChunk = Vec.new()
+    for b in [0xFF, 0xD9, 1, 2]
+        let _ = c4.push(b as u8)
+    mega_jpeg.scan_feed(var u, c4, 4)
+    test.assert_eq(u.lo, 0)
+    test.assert_eq(u.hi, 2)
+    var c5: MegaChunk = Vec.new()
+    let _ = c5.push(3 as u8)
+    mega_jpeg.scan_feed(var u, c5, 1)
+    test.assert_eq(u.lo, 0)
+    test.assert_eq(u.hi, 0)
+    test.assert_eq(u.lead, 0)
+
+// ── The controls ─────────────────────────────────────────────────────
+
+@test
+fn test_the_step_codes_alternate_plus_and_minus() [io, hw]
+    test.assert_eq(arducam_mega.level_code(0, 3), 0)
+    test.assert_eq(arducam_mega.level_code(1, 3), 1)
+    test.assert_eq(arducam_mega.level_code(-1, 3), 2)
+    test.assert_eq(arducam_mega.level_code(2, 3), 3)
+    test.assert_eq(arducam_mega.level_code(-2, 3), 4)
+    test.assert_eq(arducam_mega.level_code(3, 3), 5)
+    test.assert_eq(arducam_mega.level_code(-3, 3), 6)
+    test.assert_eq(arducam_mega.level_code(4, 4), 7)
+    test.assert_eq(arducam_mega.level_code(-4, 4), 8)
+    test.assert_eq(arducam_mega.level_code(9, 3), 5)
+    test.assert_eq(arducam_mega.level_code(-9, 3), 6)
+
+@test
+fn test_the_levels_are_written_to_their_registers() [io, hw]
+    let c = cam()
+    let d = dut(c)
+    var st = arducam_mega.state_new()
+    ready(d, var st)
+    test.assert(arducam_mega.brightness_set(d, st, -4))
+    test.assert_eq(at(c.regs, 0x22), 8)
+    test.assert(arducam_mega.contrast_set(d, st, 2))
+    test.assert_eq(at(c.regs, 0x23), 3)
+    test.assert(arducam_mega.saturation_set(d, st, -3))
+    test.assert_eq(at(c.regs, 0x24), 6)
+    test.assert(arducam_mega.ev_set(d, st, 1))
+    test.assert_eq(at(c.regs, 0x25), 1)
+    test.assert(arducam_mega.white_balance_set(d, st, arducam_mega.WB_INDOOR))
+    test.assert_eq(at(c.regs, 0x26), 4)
+    test.assert(not arducam_mega.white_balance_set(d, st, 5))
+    test.assert(not arducam_mega.white_balance_set(d, st, -1))
+    test.assert(arducam_mega.quality_set(d, st, arducam_mega.QUALITY_LOW))
+    test.assert_eq(at(c.regs, 0x2A), 2)
+    test.assert(not arducam_mega.quality_set(d, st, 3))
+    test.assert(not arducam_mega.quality_set(d, st, -1))
+    test.assert(arducam_mega.rotation_set(d, st, true))
+    test.assert_eq(at(c.regs, 0x2B), 1)
+    test.assert(arducam_mega.rotation_set(d, st, false))
+    test.assert_eq(at(c.regs, 0x2B), 0)
+
+@test
+fn test_every_control_is_refused_before_bring_up_and_while_asleep() [io, hw]
+    let c = cam()
+    let d = dut(c)
+    var st = arducam_mega.state_new()
+    for round in 0..2
+        if round == 1
+            ready(d, var st)
+            st = slept(st)
+        test.assert(not arducam_mega.brightness_set(d, st, 1))
+        test.assert(not arducam_mega.contrast_set(d, st, 1))
+        test.assert(not arducam_mega.saturation_set(d, st, 1))
+        test.assert(not arducam_mega.ev_set(d, st, 1))
+        test.assert(not arducam_mega.white_balance_set(d, st, 1))
+        test.assert(not arducam_mega.effect_set(d, st, 1))
+        test.assert(not arducam_mega.quality_set(d, st, 1))
+        test.assert(not arducam_mega.rotation_set(d, st, true))
+        test.assert(not arducam_mega.sharpness_set(d, st, 1))
+        test.assert(not arducam_mega.focus_set(d, st, 1))
+        test.assert(not arducam_mega.auto_set(d, st, 0, true))
+        test.assert(not arducam_mega.exposure_set(d, st, 100))
+        test.assert(not arducam_mega.gain_set(d, st, 10))
+        test.assert(not arducam_mega.ae_freeze_set(d, st, true))
+        test.assert(not arducam_mega.awb_freeze_set(d, st, true))
+    test.assert_eq(at(c.st, 99), 0)
+
+@test
+fn test_the_special_effects_follow_the_module() [io, hw]
+    let c = cam()
+    c.st.insert(18, 0x86)
+    let d = dut(c)
+    var st = arducam_mega.state_new()
+    ready(d, var st)
+    test.assert(arducam_mega.effect_set(d, st, arducam_mega.FX_SEPIA))
+    test.assert_eq(at(c.regs, 0x27), 4)
+    test.assert(arducam_mega.effect_set(d, st, arducam_mega.FX_LIGHT_YELLOW))
+    test.assert_eq(at(c.regs, 0x27), 9)
+    test.assert(not arducam_mega.effect_set(d, st, arducam_mega.FX_SOLARIZE))
+    test.assert(not arducam_mega.effect_set(d, st, arducam_mega.FX_OVER_EXPOSURE))
+    test.assert(not arducam_mega.effect_set(d, st, -1))
+    let c5 = cam()
+    let d5 = dut(c5)
+    var st5 = arducam_mega.state_new()
+    ready(d5, var st5)
+    test.assert(arducam_mega.effect_set(d5, st5, arducam_mega.FX_GREENISH))
+    test.assert(not arducam_mega.effect_set(d5, st5, arducam_mega.FX_LIGHT_YELLOW))
+    test.assert(arducam_mega.effect_supported(0x82, 9))
+    test.assert(not arducam_mega.effect_supported(0x85, 9))
+    test.assert(not arducam_mega.effect_supported(0x87, 9))
+    test.assert(arducam_mega.effect_supported(0x87, 0))
+
+@test
+fn test_sharpness_and_focus_only_where_the_module_has_them() [io, hw]
+    let c3 = cam()
+    c3.st.insert(18, 0x82)
+    let d3 = dut(c3)
+    var s3 = arducam_mega.state_new()
+    ready(d3, var s3)
+    test.assert(arducam_mega.sharpness_set(d3, s3, 8))
+    test.assert_eq(at(c3.regs, 0x28), 8)
+    test.assert(not arducam_mega.sharpness_set(d3, s3, 9))
+    test.assert(not arducam_mega.sharpness_set(d3, s3, -1))
+    test.assert(not arducam_mega.focus_set(d3, s3, 1))
+    let c5 = cam()
+    c5.st.insert(18, 0x81)
+    let d5 = dut(c5)
+    var s5 = arducam_mega.state_new()
+    ready(d5, var s5)
+    test.assert(arducam_mega.focus_set(d5, s5, 4))
+    test.assert_eq(at(c5.regs, 0x29), 4)
+    test.assert(not arducam_mega.focus_set(d5, s5, 5))
+    test.assert(not arducam_mega.focus_set(d5, s5, -1))
+    test.assert(not arducam_mega.sharpness_set(d5, s5, 1))
+
+@test
+fn test_the_automatic_modes_set_bit_7_and_the_new_family_waits_for_bit_3() [io, hw]
+    let c = cam()
+    let d = dut(c)
+    var st = arducam_mega.state_new()
+    ready(d, var st)
+    c.st.insert(20, 3)
+    test.assert(arducam_mega.auto_set(d, st, arducam_mega.AUTO_WHITE_BALANCE, true))
+    test.assert_eq(at(c.regs, 0x30), 0x82)
+    test.assert_eq(at(c.st, 20), 0)
+    test.assert(arducam_mega.auto_set(d, st, arducam_mega.AUTO_EXPOSURE, false))
+    test.assert_eq(at(c.regs, 0x30), 0x01)
+    test.assert(arducam_mega.auto_set(d, st, arducam_mega.AUTO_GAIN, true))
+    test.assert_eq(at(c.regs, 0x30), 0x80)
+    test.assert(not arducam_mega.auto_set(d, st, 3, true))
+    test.assert(not arducam_mega.auto_set(d, st, -1, true))
+    // Bit 3 that never clears is given up on.
+    c.st.insert(20, 5000)
+    test.assert(not arducam_mega.auto_set(d, st, arducam_mega.AUTO_GAIN, true))
+    c.st.insert(20, 0)
+    c.st.insert(30, 0x30 + 1)
+    test.assert(not arducam_mega.auto_set(d, st, arducam_mega.AUTO_GAIN, true))
+    c.st.insert(30, 0)
+    c.st.insert(31, 0x44 + 1)
+    test.assert(not arducam_mega.auto_set(d, st, arducam_mega.AUTO_GAIN, true))
+    // A legacy module does not wait for bit 3.
+    let cl = cam()
+    cl.st.insert(18, 0x84)
+    let dl = dut(cl)
+    var sl = arducam_mega.state_new()
+    ready(dl, var sl)
+    cl.st.insert(20, 5000)
+    test.assert(arducam_mega.auto_set(dl, sl, arducam_mega.AUTO_GAIN, true))
+
+@test
+fn test_the_busy_wait_reads_the_state_each_time() [io, hw]
+    let c = cam()
+    let d = dut(c)
+    var st = arducam_mega.state_new()
+    ready(d, var st)
+    // The write is acknowledged, the sensor bus is idle, and bit 3 is read
+    // until it clears: three reads of the state in all after the write.
+    c.st.insert(20, 2)
+    test.assert(arducam_mega.auto_set(d, st, arducam_mega.AUTO_EXPOSURE, true))
+    test.assert_eq(at(c.st, 14), 2)
+
+@test
+fn test_manual_exposure_is_written_in_three_bytes_on_a_legacy_module_and_two_on_a_new_one() [io, hw]
+    let c = cam()
+    let d = dut(c)
+    var st = arducam_mega.state_new()
+    ready(d, var st)
+    test.assert(arducam_mega.exposure_set(d, st, 0x1234))
+    test.assert_eq(at(c.regs, 0x34), 0x12)
+    test.assert_eq(at(c.regs, 0x35), 0x34)
+    test.assert_eq(at(c.regs, 0x33), 0)
+    test.assert(not arducam_mega.exposure_set(d, st, 0))
+    test.assert(not arducam_mega.exposure_set(d, st, 10001))
+    c.st.insert(30, 0x34 + 1)
+    test.assert(not arducam_mega.exposure_set(d, st, 100))
+    c.st.insert(30, 0x35 + 1)
+    test.assert(not arducam_mega.exposure_set(d, st, 100))
+    let cl = cam()
+    cl.st.insert(18, 0x84)
+    let dl = dut(cl)
+    var sl = arducam_mega.state_new()
+    ready(dl, var sl)
+    test.assert(arducam_mega.exposure_set(dl, sl, 0x1234))
+    test.assert_eq(at(cl.regs, 0x33), 0x00)
+    test.assert_eq(at(cl.regs, 0x34), 0x12)
+    test.assert_eq(at(cl.regs, 0x35), 0x34)
+    test.assert(arducam_mega.exposure_set(dl, sl, 0xFFFF))
+    test.assert(not arducam_mega.exposure_set(dl, sl, 0x10000))
+    cl.st.insert(30, 0x33 + 1)
+    test.assert(not arducam_mega.exposure_set(dl, sl, 100))
+
+@test
+fn test_manual_gain_is_two_registers_and_the_ov3640_table_is_indexed_not_trusted() [io, hw]
+    let c = cam()
+    let d = dut(c)
+    var st = arducam_mega.state_new()
+    ready(d, var st)
+    test.assert(arducam_mega.gain_set(d, st, 240))
+    test.assert_eq(at(c.regs, 0x31), 0)
+    test.assert_eq(at(c.regs, 0x32), 240)
+    test.assert(arducam_mega.gain_set(d, st, 0))
+    test.assert(not arducam_mega.gain_set(d, st, 241))
+    test.assert(not arducam_mega.gain_set(d, st, -1))
+    c.st.insert(30, 0x31 + 1)
+    test.assert(not arducam_mega.gain_set(d, st, 10))
+    c.st.insert(30, 0x32 + 1)
+    test.assert(not arducam_mega.gain_set(d, st, 10))
+    let c2 = cam()
+    c2.st.insert(18, 0x82)
+    let d2 = dut(c2)
+    var s2 = arducam_mega.state_new()
+    ready(d2, var s2)
+    test.assert(arducam_mega.gain_set(d2, s2, 1))
+    test.assert_eq(at(c2.regs, 0x32), 0x00)
+    test.assert(arducam_mega.gain_set(d2, s2, 9))
+    test.assert_eq(at(c2.regs, 0x32), 0x72)
+    test.assert(arducam_mega.gain_set(d2, s2, 31))
+    test.assert_eq(at(c2.regs, 0x32), 0xFF)
+    test.assert(not arducam_mega.gain_set(d2, s2, 32))
+    test.assert(not arducam_mega.gain_set(d2, s2, 0))
+    let c4 = cam()
+    c4.st.insert(18, 0x84)
+    let d4 = dut(c4)
+    var s4 = arducam_mega.state_new()
+    ready(d4, var s4)
+    test.assert(arducam_mega.gain_set(d4, s4, 0x3FF))
+    test.assert_eq(at(c4.regs, 0x31), 0x03)
+    test.assert_eq(at(c4.regs, 0x32), 0xFF)
+
+@test
+fn test_ae_and_awb_freeze_exist_on_the_new_family_only() [io, hw]
+    let c = cam()
+    let d = dut(c)
+    var st = arducam_mega.state_new()
+    ready(d, var st)
+    test.assert(arducam_mega.ae_freeze_set(d, st, true))
+    test.assert_eq(at(c.regs, 0x2C), 1)
+    test.assert(arducam_mega.ae_freeze_set(d, st, false))
+    test.assert_eq(at(c.regs, 0x2C), 0)
+    test.assert(arducam_mega.awb_freeze_set(d, st, true))
+    test.assert_eq(at(c.regs, 0x2D), 1)
+    test.assert(arducam_mega.awb_freeze_set(d, st, false))
+    test.assert_eq(at(c.regs, 0x2D), 0)
+    let cl = cam()
+    cl.st.insert(18, 0x83)
+    let dl = dut(cl)
+    var sl = arducam_mega.state_new()
+    ready(dl, var sl)
+    test.assert(not arducam_mega.ae_freeze_set(dl, sl, true))
+    test.assert(not arducam_mega.awb_freeze_set(dl, sl, true))
+
+// ── Low power ────────────────────────────────────────────────────────
+
+@test
+fn test_low_power_on_the_legacy_modules_writes_register_2() [io, hw]
+    for id in [0x81, 0x82]
+        let c = cam()
+        c.st.insert(18, id)
+        let d = dut(c)
+        var st = arducam_mega.state_new()
+        ready(d, var st)
+        test.assert(arducam_mega.power_set(d, var st, true))
+        log_is(c, wr_log(0x02, 0x07))
+        test.assert(st.asleep)
+        test.assert(arducam_mega.power_set(d, var st, false))
+        log_is(c, wr_log(0x02, 0x05))
+        test.assert(not st.asleep)
+        c.st.insert(30, 0x02 + 1)
+        test.assert(not arducam_mega.power_set(d, var st, true))
+        test.assert(not st.asleep)
+
+@test
+fn test_low_power_on_the_new_family_writes_register_0x28_and_waits() [io, hw]
+    let c = cam()
+    let d = dut(c)
+    var st = arducam_mega.state_new()
+    ready(d, var st)
+    test.assert(arducam_mega.power_set(d, var st, true))
+    var want: [Int] = []
+    for part in [wr_log(0x28, 1), rd_log(0x44)]
+        for v in part
+            list.push(want, v)
+    log_is(c, want)
+    test.assert(st.asleep)
+    test.assert(arducam_mega.power_set(d, var st, false))
+    test.assert_eq(at(c.regs, 0x28), 0)
+    test.assert(not st.asleep)
+
+@test
+fn test_low_power_on_the_two_underscore_2_modules_writes_three_sensor_registers() [io, hw]
+    for id in [0x83, 0x84]
+        let c = cam()
+        c.st.insert(18, id)
+        let d = dut(c)
+        var st = arducam_mega.state_new()
+        ready(d, var st)
+        test.assert(arducam_mega.power_set(d, var st, true))
+        var want: [Int] = []
+        let idle = rd_log(0x44)
+        for part in [wr_log(0x0B, 0x00), idle, wr_log(0x0C, 0x28), idle, wr_log(0x0E, 0xD0), idle, wr_log(0x0D, 0x00), idle,
+                     wr_log(0x0B, 0x00), idle, wr_log(0x0C, 0x2A), idle, wr_log(0x0E, 0x10), idle, wr_log(0x0D, 0x7E), idle,
+                     wr_log(0x0B, 0x0F), idle, wr_log(0x0C, 0x12), idle, wr_log(0x0E, 0x00), idle, wr_log(0x0D, 0x01), idle]
+            for v in part
+                list.push(want, v)
+        log_is(c, want)
+        test.assert(st.asleep)
+        test.assert(arducam_mega.power_set(d, var st, false))
+        test.assert_eq(at(c.regs, 0x0D), 0)
+        test.assert(not st.asleep)
+
+@test
+fn test_low_power_stops_at_each_refused_sensor_write() [io, hw]
+    let regs = [0x0B, 0x0C, 0x0E, 0x0D]
+    for r in regs
+        let c = cam()
+        c.st.insert(18, 0x83)
+        let d = dut(c)
+        var st = arducam_mega.state_new()
+        ready(d, var st)
+        c.st.insert(30, r + 1)
+        test.assert(not arducam_mega.power_set(d, var st, true))
+        test.assert(not st.asleep)
+    // The second and the third group fail on their own value.
+    for pair in [[0x0C, 0x2A], [0x0D, 0x7E], [0x0C, 0x12], [0x0E, 0x00]]
+        let c = cam()
+        c.st.insert(18, 0x84)
+        let d = dut(c)
+        var st = arducam_mega.state_new()
+        ready(d, var st)
+        c.st.insert(30, pair[0] + 1)
+        c.st.insert(34, pair[1] + 1)
+        test.assert(not arducam_mega.power_set(d, var st, true))
+    for pair in [[0x0B, 0x00], [0x0E, 0x10], [0x0C, 0x28], [0x0E, 0xD0]]
+        let c = cam()
+        c.st.insert(18, 0x84)
+        let d = dut(c)
+        var st = arducam_mega.state_new()
+        ready(d, var st)
+        c.st.insert(30, pair[0] + 1)
+        c.st.insert(34, pair[1] + 1)
+        test.assert(not arducam_mega.power_set(d, var st, true))
+
+@test
+fn test_low_power_is_refused_before_bring_up() [io, hw]
+    let c = cam()
+    let d = dut(c)
+    var st = arducam_mega.state_new()
+    test.assert(not arducam_mega.power_set(d, var st, true))
+    test.assert_eq(at(c.st, 99), 0)
+
+// ── The tables ───────────────────────────────────────────────────────
+
+@test
+fn test_the_module_tables_follow_the_sdk() [io, hw]
+    test.assert(arducam_mega.model_known(0x81))
+    test.assert(arducam_mega.model_known(0x87))
+    test.assert(not arducam_mega.model_known(0x80))
+    test.assert(not arducam_mega.model_known(0x88))
+    test.assert(arducam_mega.model_new(0x85))
+    test.assert(not arducam_mega.model_new(0x84))
+    test.assert(not arducam_mega.model_new(0x88))
+    test.assert_eq(arducam_mega.model_megapixels(0x81), 5)
+    test.assert_eq(arducam_mega.model_megapixels(0x83), 5)
+    test.assert_eq(arducam_mega.model_megapixels(0x85), 5)
+    test.assert_eq(arducam_mega.model_megapixels(0x82), 3)
+    test.assert_eq(arducam_mega.model_megapixels(0x84), 3)
+    test.assert_eq(arducam_mega.model_megapixels(0x86), 3)
+    test.assert_eq(arducam_mega.model_megapixels(0x87), 2)
+    test.assert_eq(arducam_mega.model_megapixels(0x00), 0)
+    test.assert_eq(arducam_mega.model_res_mask(0x00), 0)
+    // The count of sizes each module takes.
+    var counts: [Int] = []
+    for id in [0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87]
+        var n = 0
+        for r in 0..14
+            if arducam_mega.res_supported(id, r)
+                n = n + 1
+        list.push(counts, n)
+    test.assert_eq(counts[0], 9)
+    test.assert_eq(counts[1], 9)
+    test.assert_eq(counts[2], 9)
+    test.assert_eq(counts[3], 9)
+    test.assert_eq(counts[4], 14)
+    test.assert_eq(counts[5], 13)
+    test.assert_eq(counts[6], 11)
+    test.assert(arducam_mega.res_supported(0x81, arducam_mega.RES_2592X1944))
+    test.assert(not arducam_mega.res_supported(0x81, arducam_mega.RES_2048X1536))
+    test.assert(arducam_mega.res_supported(0x82, arducam_mega.RES_2048X1536))
+    test.assert(not arducam_mega.res_supported(0x82, arducam_mega.RES_2592X1944))
+    test.assert(not arducam_mega.res_supported(0x00, 0))
+    test.assert(not arducam_mega.res_supported(0x85, 14))
+    test.assert(not arducam_mega.res_supported(0x85, -1))
+    // The legacy codes are the Application Note's table.
+    var codes: [Int] = []
+    for r in 0..14
+        list.push(codes, arducam_mega.legacy_res_code(r))
+    test.assert_eq(codes[0], 10)
+    test.assert_eq(codes[1], 11)
+    test.assert_eq(codes[2], -1)
+    test.assert_eq(codes[3], 1)
+    test.assert_eq(codes[4], 12)
+    test.assert_eq(codes[5], 2)
+    test.assert_eq(codes[6], -1)
+    test.assert_eq(codes[7], -1)
+    test.assert_eq(codes[8], 4)
+    test.assert_eq(codes[9], -1)
+    test.assert_eq(codes[10], 6)
+    test.assert_eq(codes[11], 7)
+    test.assert_eq(codes[12], 8)
+    test.assert_eq(codes[13], 9)
+    test.assert_eq(arducam_mega.res_code(0x85, 5), 5)
+    test.assert_eq(arducam_mega.res_code(0x81, 5), 2)
+    // The pixel sizes.
+    var wh: [Int] = []
+    for r in 0..14
+        list.push(wh, arducam_mega.res_width(r) * 10000 + arducam_mega.res_height(r))
+    test.assert_eq(wh[0], 96 * 10000 + 96)
+    test.assert_eq(wh[2], 160 * 10000 + 120)
+    test.assert_eq(wh[5], 640 * 10000 + 480)
+    test.assert_eq(wh[9], 1280 * 10000 + 1024)
+    test.assert_eq(wh[13], 2592 * 10000 + 1944)
+    test.assert_eq(arducam_mega.res_width(14), 0)
+    test.assert_eq(arducam_mega.res_height(14), 0)
+    test.assert_eq(arducam_mega.res_width(1) * arducam_mega.res_height(1), 16384)
+    test.assert_eq(arducam_mega.res_width(3) * arducam_mega.res_height(3), 76800)
+    test.assert_eq(arducam_mega.res_width(4) * arducam_mega.res_height(4), 102400)
+    test.assert_eq(arducam_mega.res_width(6) * arducam_mega.res_height(6), 480000)
+    test.assert_eq(arducam_mega.res_width(7) * arducam_mega.res_height(7), 786432)
+    test.assert_eq(arducam_mega.res_width(8) * arducam_mega.res_height(8), 921600)
+    test.assert_eq(arducam_mega.res_width(10) * arducam_mega.res_height(10), 1920000)
+    test.assert_eq(arducam_mega.res_width(11) * arducam_mega.res_height(11), 2073600)
+    test.assert_eq(arducam_mega.res_width(12) * arducam_mega.res_height(12), 3145728)
+
+@test
+fn test_the_limits_follow_the_sdk() [io, hw]
+    test.assert_eq(arducam_mega.exposure_min(0x85), 1)
+    test.assert_eq(arducam_mega.exposure_max(0x85), 10000)
+    test.assert_eq(arducam_mega.exposure_max(0x81), 30000)
+    test.assert_eq(arducam_mega.exposure_max(0x83), 0xFFFF)
+    test.assert_eq(arducam_mega.exposure_max(0x84), 0xFFFF)
+    test.assert_eq(arducam_mega.gain_min(0x85), 0)
+    test.assert_eq(arducam_mega.gain_min(0x81), 1)
+    test.assert_eq(arducam_mega.gain_max(0x86), 240)
+    test.assert_eq(arducam_mega.gain_max(0x81), 1023)
+    test.assert_eq(arducam_mega.gain_max(0x82), 31)
+    test.assert_eq(arducam_mega.gain_max(0x83), 0xFFFF)
+    test.assert(arducam_mega.model_sharpness(0x84))
+    test.assert(not arducam_mega.model_sharpness(0x85))
+    test.assert(arducam_mega.model_focus(0x83))
+    test.assert(not arducam_mega.model_focus(0x86))
+    test.assert(arducam_mega.model_freeze(0x87))
+    test.assert(not arducam_mega.model_freeze(0x81))
+
+// ── The board's type, over absent hardware ───────────────────────────
+
+@test
+fn test_the_board_type_over_absent_hardware() [io, hw]
+    let w = DeviceWiring { bus: 0, addr: None, cs: None, irq: None, en: None }
+    var cam = Arducam.attach(BoardSpi { id: 0 }, BoardTimer { id: 0 }, BoardGpio { id: 0 }, w)
+    test.assert(not cam.begin())
+    test.assert_eq(cam.model(), 0)
+    test.assert(cam.chip_id() == None)
+    test.assert(cam.firmware() == None)
+    test.assert(not cam.configure(arducam_mega.FMT_JPEG, arducam_mega.RES_640X480))
+    test.assert(not cam.capture())
+    test.assert_eq(cam.frame_len(), 0)
+    test.assert_eq(cam.frame_left(), 0)
+    var chunk: MegaChunk = Vec.new()
+    test.assert_eq(cam.read_chunk(16, var chunk), 0)
+    // The link under the type: its burst and its wait.
+    test.assert(not cam.link.burst(true, 4, var chunk))
+    cam.link.wait_ms(1)
+    test.assert(not cam.finish())
+    test.assert(not cam.reset())
+    test.assert(not cam.sleep())
+    test.assert(not cam.wake())
+    test.assert(not cam.set_brightness(1))
+    test.assert(not cam.set_contrast(1))
+    test.assert(not cam.set_saturation(1))
+    test.assert(not cam.set_ev(1))
+    test.assert(not cam.set_white_balance(1))
+    test.assert(not cam.set_effect(1))
+    test.assert(not cam.set_quality(1))
+    test.assert(not cam.set_rotation(true))
+    test.assert(not cam.set_sharpness(1))
+    test.assert(not cam.set_focus(1))
+    test.assert(not cam.set_auto(0, true))
+    test.assert(not cam.set_exposure(100))
+    test.assert(not cam.set_gain(1))
+    test.assert(not cam.freeze_ae(true))
+    test.assert(not cam.freeze_awb(true))
+
+// A board type whose state says it is brought up, so the type's methods
+// reach the link: its bus is absent, so every transfer is refused.
+@test
+fn test_the_board_type_with_a_state_that_is_up_reaches_the_bus() [io, hw]
+    let w = DeviceWiring { bus: 0, addr: None, cs: None, irq: None, en: None }
+    let up = MegaState { model: 0x85, format: 1, res: 5, first: true, total: 10, left: 10, asleep: false }
+    var cam = Arducam { link: MegaLink { bus: BoardSpi { id: 0 }, timer: BoardTimer { id: 0 }, pins: BoardGpio { id: 0 }, w: w }, st: up }
+    test.assert_eq(cam.frame_len(), 10)
+    test.assert_eq(cam.frame_left(), 10)
+    test.assert(not cam.configure(arducam_mega.FMT_RGB565, 5))
+    test.assert(not cam.capture())
+    var chunk: MegaChunk = Vec.new()
+    test.assert_eq(cam.read_chunk(16, var chunk), 0)
+    test.assert(not cam.set_brightness(1))
+    test.assert(not cam.set_contrast(1))
+    test.assert(not cam.set_saturation(1))
+    test.assert(not cam.set_ev(1))
+    test.assert(not cam.set_white_balance(1))
+    test.assert(not cam.set_effect(1))
+    test.assert(not cam.set_quality(1))
+    test.assert(not cam.set_rotation(true))
+    test.assert(not cam.set_auto(0, true))
+    test.assert(not cam.set_exposure(100))
+    test.assert(not cam.set_gain(1))
+    test.assert(not cam.freeze_ae(true))
+    test.assert(not cam.freeze_awb(true))
+    test.assert(not cam.sleep())
+    test.assert(not cam.wake())
+    test.assert(not cam.reset())
+    test.assert(not cam.finish())
+
+// ── The host helper ──────────────────────────────────────────────────
+
+@test
+fn test_the_host_helper_trims_and_writes_a_picture() [io, hw, fs]
+    let img = picture()
+    var padded: [Int] = [9, 8, 0xFF, 0xFF]
+    for b in img
+        list.push(padded, b)
+    for b in [0, 0, 0xFF, 0xD9, 7]
+        list.push(padded, b)
+    let trimmed = mega_file.jpeg_trim(padded)
+    test.assert_eq(trimmed.len(), img.len())
+    for i in 0..img.len()
+        test.assert_eq(trimmed[i], img[i])
+    // No start marker: unchanged.
+    let plain = mega_file.jpeg_trim([1, 2, 3])
+    test.assert_eq(plain.len(), 3)
+    // A start and no end: to the end of the data.
+    let open_end = mega_file.jpeg_trim([5, 0xFF, 0xD8, 1, 2])
+    test.assert_eq(open_end.len(), 4)
+    test.assert_eq(open_end[0], 0xFF)
+    // The file is replaced, not overwritten in place.
+    let out_path = fs.temp_file()
+    test.assert(fs.write(out_path, "a much longer file than the picture, which has to disappear"))
+    test.assert(mega_file.jpeg_save(out_path, padded))
+    test.assert_eq(fs.size(out_path) ?? -1, img.len())
+    let back = fs.read_bytes(out_path)
+    test.assert(back != None)
+    test.assert(mega_file.jpeg_write(out_path, img))
+    test.assert_eq(fs.size(out_path) ?? -1, img.len())
+    test.assert(fs.delete(out_path))
+    test.assert(mega_file.jpeg_write(out_path, img))
+    test.assert(fs.delete(out_path))
+
+@test
+fn test_the_host_helper_reports_a_file_it_cannot_write() [io, hw, fs]
+    let dir = fs.temp_dir()
+    test.assert(not mega_file.jpeg_write("${dir}/no/such/directory/x.jpg", [1, 2, 3]))
+    // A path that exists and cannot be deleted: a directory with a file in it.
+    let busy = "${dir}/busy"
+    test.assert(fs.mkdir(busy))
+    test.assert(fs.write("${busy}/f", "x"))
+    test.assert(not mega_file.jpeg_write(busy, [1, 2, 3]))
+    // A descriptor that is not one.
+    test.assert(not mega_file.jpeg_put(-1, [1, 2, 3]))
+    test.assert(fs.delete("${busy}/f"))
+    test.assert(fs.delete(busy))
+    test.assert(fs.delete(dir))
+
+@test
+fn test_the_idle_wait_polls_every_2_ms_up_to_the_tries_it_is_given() [io, hw]
+    let c = cam()
+    let d = dut(c)
+    c.st.insert(4, 3)
+    test.assert(arducam_mega.idle_wait(d, 5))
+    test.assert_eq(at(c.st, 14), 6)
+    c.st.insert(4, 9)
+    c.st.insert(14, 0)
+    test.assert(not arducam_mega.idle_wait(d, 4))
+    test.assert_eq(at(c.st, 14), 8)
+    c.st.insert(31, 0x44 + 1)
+    test.assert(not arducam_mega.idle_wait(d, 4))
