@@ -60,6 +60,9 @@ and the 5 MP, and the 2 MP the SDK lists with them.
 - The documents read are the Application Note of September 2023 and the SDK
   at commit `146e058b1b5e` (version 3.0.0).
 - The device program builds for the nRF52840 DK and the nRF54LM20 DK, whose
-  board packages answer for SPI as absent hardware: on those images `begin`
-  answers `false` until the boards drive the bus. The gap is tracked by
-  `features/embedded-devex/nordic-twim-i2c-driver.md`.
+  board packages drive an SPI bus with an SPIM block driver (SPIM2 on the
+  nRF52840 DK, SCK P1.15, MISO P1.14, MOSI P1.13; SPIM21 on the nRF54LM20 DK,
+  SCK P1.07, MOSI P1.06, MISO P1.05), so the capture path links on both. The
+  bus was checked on the bench with nothing wired; a reply from the camera
+  over the bus is NOT VERIFIED until the driver rig. With no module attached
+  `begin` answers `false`.

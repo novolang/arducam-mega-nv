@@ -2,7 +2,7 @@
 
 A driver for Arducam's Mega SPI camera modules, the 3 MP and the 5 MP, on an SPI bus. The modules are specified in Arducam's "Mega SPI Camera Series Application Note" (September 2023) and in Arducam's open C SDK, `ArduCAM/Arducam_Mega`, commit `146e058b1b5e` (SDK version 3.0.0, 2025-06-20). A module takes a picture in JPEG, RGB565 or YUV and holds it in an 8 MB FIFO that the host reads over SPI. The driver sets the format and the size, takes a picture, hands the FIFO to the caller in chunks the caller sizes, finds the start and the end of a JPEG in the chunks, and sets the image controls the SDK has. The 2 MP module that the SDK also lists is covered by the same code. A program on a computer finds the same markers in a log and writes the picture to a file with `mega_file`.
 
-**Hardware verification: NOT VERIFIED.** No board on the bench carries an Arducam Mega module, so the driver has run only against a double of the module, in the host suite, which plays a JPEG made on the host and not a recording of a camera. The device program below builds for the nRF52840 DK and the nRF54LM20 DK and has not been flashed. Neither Nordic board package drives its SPI peripheral yet, so a program on either board reaches the module only after that driver exists (see "The device program").
+**Hardware verification: NOT VERIFIED.** No board on the bench carries an Arducam Mega module, so the driver has run only against a double of the module, in the host suite, which plays a JPEG made on the host and not a recording of a camera. The device program below builds for the nRF52840 DK and the nRF54LM20 DK and has not been flashed. Both boards drive an SPI bus (see "The device program"), checked on the bench with nothing wired, so a reply from the camera over the bus is NOT VERIFIED until the driver rig.
 
 ## The device program
 
@@ -76,12 +76,12 @@ probe-rs run --chip nRF52840_xxAA main.elf
 
 | Image | Flash | Of which program | RAM at start (`.data` and `.bss`) |
 |---|---|---|---|
-| `nrf52840-dk` | 18,420 B | 6,164 B | 2,660 B |
-| `nrf54lm20-dk` | 19,292 B | 6,288 B | 2,644 B |
+| `nrf52840-dk` | 18,876 B | 6,680 B | 3,172 B |
+| `nrf54lm20-dk` | 19,948 B | 6,946 B | 3,156 B |
 
-The numbers are from the build's memory report. Flash also holds the runtime, the compiler's support library and the program's tables. The arena, 65,536 B on both boards, is the runtime's heap and is reserved whether or not the program uses it; the driver allocates nothing in it. The driver's state is an `Arducam` value of 152 bytes and the chunk buffer a `MegaChunk` of 264 bytes, both in the program's frame.
+The numbers are from the build's memory report. Before the Nordic buses landed, with the SPI peripheral answered as absent hardware, the images were 18,420 B of flash and 2,660 B of RAM on the nRF52840 DK and 19,292 B and 2,644 B on the nRF54LM20 DK. Flash also holds the runtime, the compiler's support library and the program's tables. The arena, 65,536 B on both boards, is the runtime's heap and is reserved whether or not the program uses it; the driver allocates nothing in it. The driver's state is an `Arducam` value of 152 bytes and the chunk buffer a `MegaChunk` of 264 bytes, both in the program's frame.
 
-Neither Nordic board package names a driver for its SPI peripheral (`@hal(spi)`), so `BoardSpi` is absent hardware on both: every transfer is refused or answers nothing, and the program prints `no answer from the camera`. The novo-lang repository tracks the missing Nordic bus drivers. The wiring when a bus exists: SCK, MOSI and MISO to the board's first SPI bus, CS to a free GPIO pin, which the wiring record names, and the module's supply to 3.3 V.
+Both Nordic board packages name an SPIM block driver for `hal.spi`, so the capture path links on both and `BoardSpi { id: 0 }` is the board's bus: SPIM2 on the nRF52840 DK (SCK P1.15, MISO P1.14, MOSI P1.13) and SPIM21 on the nRF54LM20 DK (SCK P1.07, MOSI P1.06, MISO P1.05); `docs/hal/README.md` of the novo-lang repository lists them under "The Nordic DKs' buses". The bus was checked on the bench with nothing wired, so with no module attached the program prints `no answer from the camera`. A reply from the camera over the bus is NOT VERIFIED until the driver rig. The wiring: SCK, MOSI and MISO to the pins above, CS to a free GPIO pin, which the wiring record names, and the module's supply to 3.3 V.
 
 ### The effects
 
