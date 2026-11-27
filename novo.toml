@@ -1,6 +1,6 @@
 [package]
 name        = "arducam-mega-nv"
-version     = "0.1.1"
+version     = "0.1.2"
 description = "A driver for Arducam's Mega 3 MP and 5 MP SPI camera modules: the SPI register protocol, the capture sequence for JPEG, RGB565 and YUV pictures, the FIFO read in chunks the caller sizes with the JPEG start and end markers found for them, the image controls the Arducam SDK exposes, the low-power mode, and a host-side helper that writes a captured JPEG to a file."
 license     = "Apache-2.0"
 stability   = "experimental"

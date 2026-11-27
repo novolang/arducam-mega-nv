@@ -42,7 +42,7 @@ fn take(var cam: Arducam) [hw]
         if n == 0
             break
         mega_jpeg.scan_feed(var scan, chunk, n)
-    let _ = cam.finish()
+    cam.finish()
     if mega_jpeg.scan_done(scan)
         hal.uart.write("jpeg ")
         // ... the length, mega_jpeg.scan_length(scan), written a digit at a time
